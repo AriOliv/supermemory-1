@@ -4,6 +4,7 @@ import { useOrgMemberRole } from "@/hooks/use-org-member-role"
 import { cn } from "@lib/utils"
 import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { ChevronDown, Loader2, Plus, XIcon } from "lucide-react"
+import dynamic from "next/dynamic"
 import { useCallback, useEffect, useState } from "react"
 import {
 	Dialog,
@@ -20,8 +21,15 @@ import {
 import { toast } from "sonner"
 import { dmSans125ClassName } from "@/lib/fonts"
 import { useHasCompanyBrain } from "@/hooks/use-company-brain"
+import type { McpDirectoryEntry } from "@/lib/mcp-directory"
 import { brainConnectorIcon, SlackMark } from "../brain-connector-icons"
 import { PillButton } from "../integrations/install-steps"
+
+const McpDirectoryBrowser = dynamic(() =>
+	import("./mcp-directory-browser").then(
+		(module) => module.McpDirectoryBrowser,
+	),
+)
 
 const BACKEND =
 	process.env.NEXT_PUBLIC_BACKEND_URL ?? "https://api.supermemory.ai"
@@ -56,6 +64,19 @@ function slugifyMcpName(value: string) {
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-+|-+$/g, "")
 		.slice(0, 63)
+}
+
+function customConnectionName(slug: string) {
+	return titleCase(slug.replace(/-dir-[a-z0-9]{6}$/, "").replace(/-/g, " "))
+}
+
+function stableDirectorySuffix(value: string) {
+	let hash = 0x811c9dc5
+	for (const character of value) {
+		hash ^= character.codePointAt(0) ?? 0
+		hash = Math.imul(hash, 0x01000193)
+	}
+	return (hash >>> 0).toString(36).slice(0, 6).padStart(6, "0")
 }
 
 const pillLinkClass = cn(
@@ -369,6 +390,12 @@ export default function CompanyBrainConnections() {
 		{ name: string; value: string }[]
 	>([])
 	const [customAdvancedOpen, setCustomAdvancedOpen] = useState(false)
+	const [customAuthMethod, setCustomAuthMethod] = useState<"oauth" | "api-key">(
+		"oauth",
+	)
+	const [directoryOpen, setDirectoryOpen] = useState(false)
+	const [directoryEntry, setDirectoryEntry] =
+		useState<McpDirectoryEntry | null>(null)
 
 	const { isAdmin } = useOrgMemberRole(isCompanyBrain)
 
@@ -481,17 +508,32 @@ export default function CompanyBrainConnections() {
 
 	const resetCustomForm = () => {
 		setCustomOpen(false)
+		setDirectoryEntry(null)
 		setCustomName("")
 		setCustomServerUrl("")
 		setCustomToken("")
 		setCustomHeaderName("")
 		setCustomExtraHeaders([])
 		setCustomAdvancedOpen(false)
+		setCustomAuthMethod("oauth")
+	}
+
+	const setUpDirectoryEntry = (entry: McpDirectoryEntry) => {
+		setDirectoryEntry(entry)
+		setCustomName(entry.name)
+		setCustomServerUrl(entry.url ?? "")
+		setCustomAdvancedOpen(false)
+		setCustomAuthMethod("oauth")
+		setCustomOpen(true)
 	}
 
 	const connectCustom = async (event: React.FormEvent<HTMLFormElement>) => {
 		event.preventDefault()
-		const slug = slugifyMcpName(customName)
+		const slug = directoryEntry
+			? `${slugifyMcpName(directoryEntry.name).slice(0, 52)}-dir-${stableDirectorySuffix(
+					directoryEntry.url ?? directoryEntry.note ?? directoryEntry.id,
+				)}`
+			: slugifyMcpName(customName)
 		const serverUrl = customServerUrl.trim()
 		if (!slug) {
 			toast.error("Enter a custom MCP name.")
@@ -509,7 +551,11 @@ export default function CompanyBrainConnections() {
 		const key = `custom:${slug}`
 		setBusy(key)
 		try {
-			const token = customToken.trim()
+			const token = customAuthMethod === "api-key" ? customToken.trim() : ""
+			if (customAuthMethod === "api-key" && !token) {
+				toast.error("Enter an API key.")
+				return
+			}
 			if (token) {
 				const rows = customExtraHeaders
 					.map((h) => [h.name.trim(), h.value.trim()] as const)
@@ -543,7 +589,7 @@ export default function CompanyBrainConnections() {
 					toast.error(data.error ?? "Couldn't connect.")
 					return
 				}
-				toast.success(`${slug} connected.`)
+				toast.success(`${customName} connected.`)
 				resetCustomForm()
 				await load()
 				return
@@ -571,7 +617,7 @@ export default function CompanyBrainConnections() {
 				window.open(data.authUrl, "_blank", "noopener")
 				resetCustomForm()
 			} else if (data.ok) {
-				toast.success(`${slug} connected.`)
+				toast.success(`${customName} connected.`)
 				resetCustomForm()
 				await load()
 			} else {
@@ -696,7 +742,7 @@ export default function CompanyBrainConnections() {
 						{customRows.map((row) => (
 							<AppCard
 								key={`custom-${row.serverSlug}`}
-								name={titleCase(row.serverSlug.replace(/-/g, " "))}
+								name={customConnectionName(row.serverSlug)}
 								subtitle={row.serverUrl ?? "Custom OAuth MCP"}
 								icon={brainConnectorIcon(row.serverSlug, row.serverSlug)}
 								userConnected
@@ -709,7 +755,7 @@ export default function CompanyBrainConnections() {
 									disconnect(
 										{
 											slug: row.serverSlug,
-											name: titleCase(row.serverSlug.replace(/-/g, " ")),
+											name: customConnectionName(row.serverSlug),
 											category: "Custom OAuth MCP",
 											authType: "oauth",
 										},
@@ -734,10 +780,36 @@ export default function CompanyBrainConnections() {
 				)}
 			</div>
 
+			{directoryOpen ? (
+				<McpDirectoryBrowser
+					builtInSlugs={catalogSlugs}
+					onSetUp={setUpDirectoryEntry}
+				/>
+			) : (
+				<button
+					type="button"
+					onClick={() => setDirectoryOpen(true)}
+					className={cn(
+						dmSans125ClassName(),
+						"flex w-full cursor-pointer items-center justify-between rounded-xl border border-[#2A313C] border-dashed px-4 py-4 text-left transition-colors hover:border-[#3A4150]",
+					)}
+				>
+					<span>
+						<span className="block text-[14px] font-semibold text-[#FAFAFA]">
+							Browse MCP directory
+						</span>
+						<span className="mt-0.5 block text-[12px] font-medium text-[#737373]">
+							Search 654 remote and desktop MCP servers
+						</span>
+					</span>
+					<ChevronDown className="size-4 -rotate-90 text-[#737373]" />
+				</button>
+			)}
+
 			{/* Reset on every close path so the API key never lingers in state. */}
 			<Dialog
 				open={customOpen}
-				onOpenChange={(open) =>
+				onOpenChange={(open: boolean) =>
 					open ? setCustomOpen(true) : resetCustomForm()
 				}
 			>
@@ -755,11 +827,14 @@ export default function CompanyBrainConnections() {
 					<div className="flex items-start justify-between gap-4">
 						<DialogHeader className="flex-1 space-y-1 pl-1">
 							<DialogTitle className="font-semibold text-[#FAFAFA]">
-								Add custom connector
+								{directoryEntry
+									? `Set up ${directoryEntry.name}`
+									: "Add custom connector"}
 							</DialogTitle>
 							<p className="text-[13px] font-medium leading-[1.35] text-[#737373]">
-								Connect your Brain to any remote MCP server. Signs in with OAuth
-								unless you add an API key below.
+								{directoryEntry?.availability === "tenant"
+									? "Enter your workspace-specific MCP URL, then choose how this server authenticates."
+									: "Confirm the remote MCP URL, then choose how this server authenticates."}
 							</p>
 						</DialogHeader>
 						<DialogPrimitive.Close
@@ -788,21 +863,41 @@ export default function CompanyBrainConnections() {
 							className={customInputClass}
 						/>
 
-						<button
-							type="button"
-							onClick={() => setCustomAdvancedOpen((open) => !open)}
-							className="mt-1 flex items-center gap-1.5 self-start text-[13px] font-medium text-[#FAFAFA]"
-						>
-							<ChevronDown
-								className={cn(
-									"size-4 text-[#737373] transition-transform",
-									customAdvancedOpen && "rotate-180",
-								)}
-							/>
-							Advanced settings
-						</button>
+						<div className="grid grid-cols-2 gap-1 rounded-full bg-[#0D121A] p-1">
+							{(["oauth", "api-key"] as const).map((method) => (
+								<button
+									key={method}
+									type="button"
+									onClick={() => setCustomAuthMethod(method)}
+									className={cn(
+										"h-8 rounded-full text-[12px] font-semibold transition-colors",
+										customAuthMethod === method
+											? "bg-[#252B34] text-[#FAFAFA]"
+											: "text-[#737373] hover:text-[#D4D4D8]",
+									)}
+								>
+									{method === "oauth" ? "OAuth" : "API key"}
+								</button>
+							))}
+						</div>
 
-						{customAdvancedOpen && (
+						{customAuthMethod === "api-key" && (
+							<button
+								type="button"
+								onClick={() => setCustomAdvancedOpen((open) => !open)}
+								className="mt-1 flex items-center gap-1.5 self-start text-[13px] font-medium text-[#FAFAFA]"
+							>
+								<ChevronDown
+									className={cn(
+										"size-4 text-[#737373] transition-transform",
+										customAdvancedOpen && "rotate-180",
+									)}
+								/>
+								API key settings
+							</button>
+						)}
+
+						{customAuthMethod === "api-key" && customAdvancedOpen && (
 							<div className="flex flex-col gap-2">
 								<input
 									value={customToken}
