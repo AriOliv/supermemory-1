@@ -523,7 +523,7 @@ export default function CompanyBrainConnections() {
 		setCustomName(entry.name)
 		setCustomServerUrl(entry.url ?? "")
 		setCustomAdvancedOpen(false)
-		setCustomAuthMethod("oauth")
+		setCustomAuthMethod(entry.authMethods[0] ?? "oauth")
 		setCustomOpen(true)
 	}
 
@@ -869,22 +869,35 @@ export default function CompanyBrainConnections() {
 							className={customInputClass}
 						/>
 
-						<div className="grid grid-cols-2 gap-1 rounded-full bg-[#0D121A] p-1">
-							{(["oauth", "api-key"] as const).map((method) => (
-								<button
-									key={method}
-									type="button"
-									onClick={() => setCustomAuthMethod(method)}
-									className={cn(
-										"h-8 rounded-full text-[12px] font-semibold transition-colors",
-										customAuthMethod === method
-											? "bg-[#252B34] text-[#FAFAFA]"
-											: "text-[#737373] hover:text-[#D4D4D8]",
-									)}
-								>
-									{method === "oauth" ? "OAuth" : "API key"}
-								</button>
-							))}
+						<div
+							className={cn(
+								"grid gap-1 rounded-full bg-[#0D121A] p-1",
+								directoryEntry?.authMethods.length === 1
+									? "grid-cols-1"
+									: "grid-cols-2",
+							)}
+						>
+							{(["oauth", "api-key"] as const)
+								.filter(
+									(method) =>
+										!directoryEntry ||
+										directoryEntry.authMethods.includes(method),
+								)
+								.map((method) => (
+									<button
+										key={method}
+										type="button"
+										onClick={() => setCustomAuthMethod(method)}
+										className={cn(
+											"h-8 rounded-full text-[12px] font-semibold transition-colors",
+											customAuthMethod === method
+												? "bg-[#252B34] text-[#FAFAFA]"
+												: "text-[#737373] hover:text-[#D4D4D8]",
+										)}
+									>
+										{method === "oauth" ? "OAuth" : "API key"}
+									</button>
+								))}
 						</div>
 
 						{customAuthMethod === "api-key" && (

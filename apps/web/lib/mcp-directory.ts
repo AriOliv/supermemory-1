@@ -14,4 +14,8 @@ export type McpDirectoryEntry = {
 	categories: string[]
 	popularity: number
 	availability: McpDirectoryAvailability
+	iconDomain: string | null
+	setup: "custom" | "unsupported"
+	oauthCapability: "dcr" | "preregistered" | null
+	authMethods: Array<"oauth" | "api-key">
 }

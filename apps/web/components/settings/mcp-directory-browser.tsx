@@ -1,7 +1,7 @@
 "use client"
 
 import { cn } from "@lib/utils"
-import { ChevronDown, Laptop, Loader2, Search } from "lucide-react"
+import { ChevronDown, Loader2, Search } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
 import { dmSans125ClassName } from "@/lib/fonts"
 import type { McpDirectoryEntry } from "@/lib/mcp-directory"
@@ -30,6 +30,14 @@ function isDirectoryEntry(value: unknown): value is McpDirectoryEntry {
 		Array.isArray(entry.categories) &&
 		entry.categories.every((category) => typeof category === "string") &&
 		typeof entry.popularity === "number" &&
+		(entry.iconDomain === null || typeof entry.iconDomain === "string") &&
+		["custom", "unsupported"].includes(entry.setup ?? "") &&
+		(entry.oauthCapability === null ||
+			["dcr", "preregistered"].includes(entry.oauthCapability ?? "")) &&
+		Array.isArray(entry.authMethods) &&
+		entry.authMethods.every((method) =>
+			["oauth", "api-key"].includes(method),
+		) &&
 		["fixed", "tenant", "unavailable", "local"].includes(
 			entry.availability ?? "",
 		)
@@ -70,6 +78,37 @@ function entrySlug(entry: McpDirectoryEntry) {
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-+|-+$/g, "")
 		.slice(0, 63)
+}
+
+function setupLabel(entry: McpDirectoryEntry, builtIn: boolean) {
+	if (builtIn) return "Built in above"
+	if (entry.availability !== "fixed" && entry.availability !== "tenant") {
+		return AVAILABILITY_LABEL[entry.availability]
+	}
+	if (entry.oauthCapability === "preregistered") {
+		return "Requires backend OAuth permissions"
+	}
+	if (entry.oauthCapability === "dcr") {
+		return "OAuth discovery verified; setup pending"
+	}
+	if (entry.auth === "no_auth") return "No-auth servers aren't supported yet"
+	return "Authentication not verified"
+}
+
+function DirectoryIcon({ entry }: { entry: McpDirectoryEntry }) {
+	const [failed, setFailed] = useState(false)
+	if (!entry.iconDomain || failed) {
+		return brainConnectorIcon(entrySlug(entry), entry.name, "size-4")
+	}
+	return (
+		<img
+			src={`/api/mcp-icon?domain=${encodeURIComponent(entry.iconDomain)}`}
+			alt=""
+			className="size-5 object-contain"
+			loading="lazy"
+			onError={() => setFailed(true)}
+		/>
+	)
 }
 
 export function McpDirectoryBrowser({
@@ -143,9 +182,8 @@ export function McpDirectoryBrowser({
 					</span>
 				</div>
 				<p className="max-w-2xl text-[13px] font-medium leading-5 text-[#737373]">
-					Browse remote and desktop MCP servers. Remote entries open a setup
-					form so you can confirm OAuth or API-key authentication before
-					connecting.
+					Browse remote and desktop MCP servers. Setup is available only for
+					connectors with a verified end-to-end authentication flow.
 				</p>
 			</div>
 
@@ -216,10 +254,8 @@ export function McpDirectoryBrowser({
 						const builtIn = builtInSlugs.has(entrySlug(entry))
 						const canSetUp =
 							!builtIn &&
-							entry.auth !== "no_auth" &&
-							!entry.note
-								?.toLowerCase()
-								.includes("register your own oauth client") &&
+							entry.setup !== "unsupported" &&
+							entry.authMethods.length > 0 &&
 							(entry.availability === "fixed" ||
 								entry.availability === "tenant")
 						const subtitle =
@@ -235,11 +271,7 @@ export function McpDirectoryBrowser({
 							>
 								<div className="flex min-w-0 items-start gap-3">
 									<div className="flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-[9px] bg-[#080B0F]">
-										{entry.type === "local" ? (
-											<Laptop className="size-4 text-[#A1A1AA]" />
-										) : (
-											brainConnectorIcon(entrySlug(entry), entry.name, "size-4")
-										)}
+										<DirectoryIcon entry={entry} />
 									</div>
 									<div className="min-w-0">
 										<p className="truncate text-[13px] font-semibold text-[#FAFAFA]">
@@ -252,15 +284,7 @@ export function McpDirectoryBrowser({
 								</div>
 								<div className="flex items-center justify-between gap-2 border-[#20252D] border-t pt-2.5">
 									<span className="truncate text-[11px] font-medium text-[#6B7280]">
-										{builtIn
-											? "Built in above"
-											: entry.auth === "no_auth"
-												? "No-auth servers aren't supported yet"
-												: entry.note
-															?.toLowerCase()
-															.includes("register your own oauth client")
-													? "Requires your own OAuth client"
-													: AVAILABILITY_LABEL[entry.availability]}
+										{setupLabel(entry, builtIn)}
 									</span>
 									{canSetUp ? (
 										<button
