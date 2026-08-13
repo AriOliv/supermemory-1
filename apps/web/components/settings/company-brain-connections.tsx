@@ -67,7 +67,7 @@ function slugifyMcpName(value: string) {
 }
 
 function customConnectionName(slug: string) {
-	return titleCase(slug.replace(/-dir-[a-z0-9]{6}$/, "").replace(/-/g, " "))
+	return titleCase(slug.replace(/-sm-dir-[a-z0-9]{6}$/, "").replace(/-/g, " "))
 }
 
 function stableDirectorySuffix(value: string) {
@@ -530,13 +530,19 @@ export default function CompanyBrainConnections() {
 	const connectCustom = async (event: React.FormEvent<HTMLFormElement>) => {
 		event.preventDefault()
 		const slug = directoryEntry
-			? `${slugifyMcpName(directoryEntry.name).slice(0, 52)}-dir-${stableDirectorySuffix(
+			? `${slugifyMcpName(directoryEntry.name).slice(0, 49)}-sm-dir-${stableDirectorySuffix(
 					directoryEntry.url ?? directoryEntry.note ?? directoryEntry.id,
 				)}`
 			: slugifyMcpName(customName)
 		const serverUrl = customServerUrl.trim()
 		if (!slug) {
 			toast.error("Enter a custom MCP name.")
+			return
+		}
+		if (!directoryEntry && /-sm-dir-[a-z0-9]{6}$/.test(slug)) {
+			toast.error(
+				"Choose a name that doesn't use the reserved directory suffix.",
+			)
 			return
 		}
 		if (!serverUrl) {
@@ -882,6 +888,17 @@ export default function CompanyBrainConnections() {
 						</div>
 
 						{customAuthMethod === "api-key" && (
+							<input
+								value={customToken}
+								onChange={(event) => setCustomToken(event.target.value)}
+								type="password"
+								placeholder="API key"
+								required
+								className={customInputClass}
+							/>
+						)}
+
+						{customAuthMethod === "api-key" && (
 							<button
 								type="button"
 								onClick={() => setCustomAdvancedOpen((open) => !open)}
@@ -893,19 +910,12 @@ export default function CompanyBrainConnections() {
 										customAdvancedOpen && "rotate-180",
 									)}
 								/>
-								API key settings
+								Header settings
 							</button>
 						)}
 
 						{customAuthMethod === "api-key" && customAdvancedOpen && (
 							<div className="flex flex-col gap-2">
-								<input
-									value={customToken}
-									onChange={(event) => setCustomToken(event.target.value)}
-									type="password"
-									placeholder="API key (optional)"
-									className={customInputClass}
-								/>
 								<input
 									value={customHeaderName}
 									onChange={(event) => setCustomHeaderName(event.target.value)}
