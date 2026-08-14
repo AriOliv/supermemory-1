@@ -130,11 +130,14 @@ ALL_TOOL_NAMES = (
 class SupermemoryToolsConfig(TypedDict, total=False):
     """Configuration for Supermemory tools.
 
-    Only one of `project_id` or `container_tags` can be provided.
+    Only one of `project_id` or `container_tag` can be provided.
+
+    Breaking change: `container_tags` (list) was removed in favor of a single
+    `container_tag` string, matching the Supermemory v4 API.
     """
 
     base_url: Optional[str]
-    container_tags: Optional[List[str]]
+    container_tag: Optional[str]
     project_id: Optional[str]
 
 
@@ -347,16 +350,16 @@ MEMORY_TOOL_SCHEMAS: Dict[str, ChatCompletionFunctionToolParam] = {
 }
 
 
-def _resolve_container_tags(config: SupermemoryToolsConfig) -> List[str]:
-    if config.get("project_id") is not None and config.get("container_tags") is not None:
+def _resolve_container_tag(config: SupermemoryToolsConfig) -> str:
+    if config.get("project_id") is not None and config.get("container_tag") is not None:
         raise SupermemoryConfigurationError(
-            "Supermemory tools config accepts either project_id or container_tags, not both."
+            "Supermemory tools config accepts either project_id or container_tag, not both."
         )
     if config.get("project_id"):
-        return [f"sm_project_{config['project_id']}"]
-    if config.get("container_tags"):
-        return config["container_tags"]
-    return ["sm_project_default"]
+        return f"sm_project_{config['project_id']}"
+    if config.get("container_tag"):
+        return config["container_tag"]
+    return "sm_project_default"
 
 
 def _tool_definition(name: str) -> ChatCompletionToolParam:
@@ -386,10 +389,10 @@ class SupermemoryTools:
             client_kwargs["base_url"] = config["base_url"]
 
         self.client = supermemory.AsyncSupermemory(**client_kwargs)
-        self.container_tags = _resolve_container_tags(config)
+        self.container_tag = _resolve_container_tag(config)
 
     def _primary_container_tag(self, container_tag: Optional[str] = None) -> str:
-        return container_tag or self.container_tags[0]
+        return container_tag or self.container_tag
 
     def get_tool_definitions(self) -> List[ChatCompletionFunctionToolParam]:
         """Get OpenAI function definitions for all memory tools."""
@@ -431,10 +434,11 @@ class SupermemoryTools:
         try:
             response: SearchMemoriesResponse = await self.client.search.memories(
                 q=information_to_get,
-                container_tags=self.container_tags,
+                container_tag=self.container_tag,
                 limit=limit,
                 threshold=DEFAULT_CHUNK_THRESHOLD,
                 search_mode="hybrid",
+                include={"documents": include_full_docs},
             )
 
             results = response.results or []
@@ -459,7 +463,7 @@ class SupermemoryTools:
         try:
             response: AddResponse = await self.client.add(
                 content=memory,
-                container_tags=self.container_tags,
+                container_tag=self.container_tag,
             )
 
             return MemoryAddResult(
@@ -582,7 +586,7 @@ class SupermemoryTools:
 
             kwargs: Dict[str, Any] = {
                 "content": content,
-                "container_tags": self.container_tags,
+                "container_tag": self.container_tag,
             }
             if metadata:
                 kwargs["metadata"] = metadata
