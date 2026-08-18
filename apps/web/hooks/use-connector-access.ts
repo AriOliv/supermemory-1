@@ -7,6 +7,19 @@ export function useConnectorAccess(opts?: { enabled?: boolean }) {
 	const enabled = opts?.enabled ?? true
 	const autumn = useCustomer({ queryOptions: { enabled } })
 	const hasCompanyBrain = useHasCompanyBrain()
+	// Self-hosted (Avenia): no billing/Autumn, so unlock all pro-tier entitlements
+	// instead of gating connectors/plugins behind an "upgrade" prompt. Set
+	// NEXT_PUBLIC_SELF_HOSTED_UNLOCK=false to restore upstream plan gating.
+	if (process.env.NEXT_PUBLIC_SELF_HOSTED_UNLOCK !== "false") {
+		return {
+			hasPro: true,
+			hasMax: true,
+			hasScale: true,
+			hasCompanyBrain,
+			connectorAccess: true,
+			loading: false,
+		}
+	}
 	const hasPro = enabled && hasActivePlan(autumn.data?.subscriptions, "api_pro")
 	const hasMax = enabled && hasActivePlan(autumn.data?.subscriptions, "api_max")
 	const hasScale =

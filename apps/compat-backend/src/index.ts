@@ -1,6 +1,7 @@
 import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { auth } from "./auth"
+import { connectors } from "./connectors"
 
 /**
  * Compatibility backend for the Supermemory OSS console.
@@ -79,8 +80,7 @@ const STUBS: Record<string, () => Response> = {
 	"GET /v3/auth/org-summaries": () => json({ summaries: [] }),
 	"GET /v3/waitlist/status": () => json({ status: "approved" }),
 	"GET /v3/digests": () => json({ digests: [] }),
-	"GET /v3/connections": () => json([]),
-	"POST /v3/connections/list": () => json([]),
+	"GET /v3/digests/preferences": () => json({ digestOptOut: false }),
 }
 
 async function proxyToLite(c: { req: { url: string; method: string; raw: Request; header: (k: string) => string | undefined } }) {
@@ -122,6 +122,10 @@ const guarded = async (c: any) => {
 	if (!session) return json({ error: "Unauthorized" }, 401)
 	return proxyToLite(c)
 }
+
+// Knowledge-base connectors (Google Drive, ...) — real implementation, mounted
+// before the generic proxy so /v3/connections/* is handled here, not proxied/stubbed.
+app.route("/v3/connections", connectors)
 
 app.all("/v3/*", guarded)
 app.all("/v4/*", guarded)
