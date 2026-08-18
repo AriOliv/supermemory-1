@@ -174,12 +174,12 @@ async function driveAbout(accessToken: string): Promise<string | undefined> {
 }
 
 async function driveListFiles(accessToken: string, limit: number) {
-	const files: { id: string; name: string; mimeType: string }[] = []
+	const files: { id: string; name: string; mimeType: string; webViewLink?: string }[] = []
 	let pageToken: string | undefined
 	while (files.length < limit) {
 		const p = new URLSearchParams({
 			q: "trashed = false and mimeType != 'application/vnd.google-apps.folder'",
-			fields: "nextPageToken, files(id, name, mimeType)",
+			fields: "nextPageToken, files(id, name, mimeType, webViewLink)",
 			pageSize: String(Math.min(100, limit - files.length)),
 			orderBy: "modifiedTime desc",
 		})
@@ -189,7 +189,7 @@ async function driveListFiles(accessToken: string, limit: number) {
 		})
 		if (!res.ok) throw new Error(`drive list failed: ${res.status}`)
 		const j = (await res.json()) as {
-			files?: { id: string; name: string; mimeType: string }[]
+			files?: { id: string; name: string; mimeType: string; webViewLink?: string }[]
 			nextPageToken?: string
 		}
 		for (const f of j.files ?? []) files.push(f)
@@ -201,7 +201,7 @@ async function driveListFiles(accessToken: string, limit: number) {
 
 async function driveFileText(
 	accessToken: string,
-	file: { id: string; name: string; mimeType: string },
+	file: { id: string; name: string; mimeType: string; webViewLink?: string },
 ): Promise<string | null> {
 	const exportMime = EXPORT_MIME[file.mimeType]
 	let url: string
@@ -251,7 +251,14 @@ async function runSync(connId: string, trigger: "manual" | "event" | "cron") {
 				await ingest(
 					text,
 					tags,
-					{ source: "google-drive", fileId: f.id, name: f.name, mimeType: f.mimeType },
+					{
+						source: "google-drive",
+						fileId: f.id,
+						name: f.name,
+						mimeType: f.mimeType,
+						// Surfaced as the citation link in chat/MCP answers.
+						url: f.webViewLink ?? `https://drive.google.com/file/d/${f.id}/view`,
+					},
 					`gdrive:${f.id}`,
 				)
 				processed++

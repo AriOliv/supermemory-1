@@ -126,6 +126,13 @@ export const searchMemoryOutputSchema = z.object({
 			text: z.string(),
 			similarity: z.number(),
 			title: z.string().optional(),
+			// Origin of the memory (e.g. the Google Drive file it was synced from).
+			source: z
+				.object({
+					name: z.string().optional(),
+					url: z.string().optional(),
+				})
+				.optional(),
 		}),
 	),
 	total: z.number(),

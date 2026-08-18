@@ -72,6 +72,8 @@ const memoryEntriesResponseSchema = z.object({
 
 export type MemoryEntriesResponse = z.infer<typeof memoryEntriesResponseSchema>
 
+export type MemorySource = { name?: string; url?: string }
+
 export type Memory =
 	| {
 			id: string
@@ -79,6 +81,7 @@ export type Memory =
 			similarity: number
 			title?: string
 			content?: string
+			source?: MemorySource
 	  }
 	| {
 			id: string
@@ -86,6 +89,7 @@ export type Memory =
 			similarity: number
 			title?: string
 			content?: string
+			source?: MemorySource
 	  }
 
 export interface SearchResult {
@@ -120,7 +124,22 @@ const sdkResultSchema = z.looseObject({
 	similarity: z.number(),
 	title: z.string().nullish(),
 	context: z.string().nullish(),
+	metadata: z.record(z.string(), z.unknown()).nullish(),
+	filepath: z.string().nullish(),
 })
+
+// Normalize the source (origin) of a memory from its metadata — the connectors store
+// { source, name, url, fileId } so answers can cite the file it came from.
+function extractSource(
+	metadata: unknown,
+	filepath?: string | null,
+): { name?: string; url?: string } | undefined {
+	const m = metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>) : {}
+	const name =
+		typeof m.name === "string" ? m.name : filepath || undefined
+	const url = typeof m.url === "string" ? m.url : undefined
+	return name || url ? { ...(name ? { name } : {}), ...(url ? { url } : {}) } : undefined
+}
 
 function mapSdkResults(value: unknown): Memory[] {
 	return z
@@ -130,11 +149,13 @@ function mapSdkResults(value: unknown): Memory[] {
 			const text = limitByChars(
 				result.content || result.memory || result.chunk || result.context || "",
 			)
+			const source = extractSource(result.metadata, result.filepath)
 			const base = {
 				id: result.id,
 				similarity: result.similarity,
 				...(result.title ? { title: result.title } : {}),
 				...(result.content ? { content: result.content } : {}),
+				...(source ? { source } : {}),
 			}
 			if (result.chunk && !result.memory) {
 				return { ...base, chunk: text }
@@ -276,18 +297,40 @@ export class SupermemoryClient {
 			const containerTag =
 				containerTagOverride ??
 				(this.hasExplicitContainerTag ? this.containerTag : undefined)
-			const result = await this.client.search.memories({
-				q: query,
-				limit,
-				...(containerTag ? { containerTag } : {}),
-				searchMode: "hybrid",
-				threshold,
+			// Raw fetch instead of the SDK: the SDK's search.memories dropped results
+			// against the self-hosted /v4/search, and going direct also preserves each
+			// result's `metadata` (the source file name + link) for citation.
+			const response = await fetch(`${this.apiUrl}/v4/search`, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${this.bearerToken}`,
+					"Content-Type": "application/json",
+					"x-sm-source": MCP_SOURCE,
+				},
+				body: JSON.stringify({
+					q: query,
+					limit,
+					...(containerTag ? { containerTags: [containerTag] } : {}),
+					searchMode: "hybrid",
+					...(threshold != null ? { threshold } : {}),
+				}),
+				signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 			})
-
+			if (!response.ok) {
+				const message = extractApiErrorMessage(await response.text())
+				throw Object.assign(new Error(message ?? ""), {
+					status: response.status,
+				})
+			}
+			const data = (await response.json()) as {
+				results?: unknown
+				total?: number
+				timing?: number
+			}
 			return {
-				results: mapSdkResults(result.results),
-				total: result.total,
-				timing: result.timing,
+				results: mapSdkResults(data.results ?? []),
+				total: data.total ?? 0,
+				timing: data.timing ?? 0,
 			}
 		} catch (error) {
 			this.handleOperationError("Search request", error)

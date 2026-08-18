@@ -75,26 +75,58 @@ async function allContainerTags(): Promise<string[]> {
 	}
 }
 
-// Retrieve relevant memories from the lite server to ground the answer.
-async function retrieveContext(query: string, containerTags: string[]): Promise<string[]> {
-	if (!query || containerTags.length === 0) return []
+type Retrieved = { text: string; name?: string; url?: string; similarity: number }
+
+// Search a single container tag. Each result's metadata (set by the connectors, e.g. Google
+// Drive) carries the source file name + link, which we surface so the model can cite it.
+async function searchOne(query: string, containerTag: string): Promise<Retrieved[]> {
 	try {
 		const res = await fetch(`${LITE_URL}/v4/search`, {
 			method: "POST",
 			headers: { authorization: `Bearer ${LITE_KEY}`, "content-type": "application/json" },
-			body: JSON.stringify({ q: query, containerTags, limit: 8 }),
+			body: JSON.stringify({ q: query, containerTags: [containerTag], limit: 8 }),
 		})
 		if (!res.ok) return []
-		const data = (await res.json()) as { results?: Array<{ memory?: string; content?: string }> }
+		const data = (await res.json()) as {
+			results?: Array<{
+				memory?: string
+				content?: string
+				similarity?: number
+				metadata?: { name?: string; url?: string; source?: string } | null
+			}>
+		}
 		return (data.results ?? [])
-			.map((r) => r.memory ?? r.content ?? "")
-			.filter(Boolean)
+			.map((r) => ({
+				text: r.memory ?? r.content ?? "",
+				name: r.metadata?.name,
+				url: r.metadata?.url,
+				similarity: r.similarity ?? 0,
+			}))
+			.filter((r) => r.text)
 	} catch {
 		return []
 	}
 }
 
-function systemPrompt(memories: string[], user?: { name?: string; email?: string }): string {
+// Retrieve relevant memories to ground the answer. The lite /v4/search treats multiple
+// containerTags as AND (a memory must be in all of them) → 0 hits across spaces, so we query
+// each space separately and merge the top results by similarity.
+async function retrieveContext(query: string, containerTags: string[]): Promise<Retrieved[]> {
+	if (!query || containerTags.length === 0) return []
+	const perTag = await Promise.all(containerTags.map((t) => searchOne(query, t)))
+	const merged = perTag.flat().sort((a, b) => b.similarity - a.similarity)
+	const seen = new Set<string>()
+	const out: Retrieved[] = []
+	for (const r of merged) {
+		if (seen.has(r.text)) continue
+		seen.add(r.text)
+		out.push(r)
+		if (out.length >= 8) break
+	}
+	return out
+}
+
+function systemPrompt(memories: Retrieved[], user?: { name?: string; email?: string }): string {
 	const who =
 		user?.name || user?.email
 			? `\nThe person you are talking to is ${user?.name ?? "the user"}${user?.email ? ` (${user.email})` : ""}. Use this when they ask about themselves.`
@@ -102,10 +134,18 @@ function systemPrompt(memories: string[], user?: { name?: string; email?: string
 	if (memories.length === 0) {
 		return `You are Supermemory, a helpful assistant with access to the user's personal knowledge base. No relevant memories were found for this question, so answer from general knowledge and say when you are unsure.${who}`
 	}
-	const ctx = memories.map((m, i) => `[${i + 1}] ${m}`).join("\n")
+	const ctx = memories
+		.map((m, i) => {
+			const src =
+				m.name || m.url
+					? ` — source: ${m.name ?? "document"}${m.url ? ` (${m.url})` : ""}`
+					: ""
+			return `[${i + 1}] ${m.text}${src}`
+		})
+		.join("\n")
 	return `You are Supermemory, a helpful assistant that answers using the user's personal knowledge base (memories synced from their sources, e.g. Google Drive).
 
-Use the memories below as your primary source. If the answer isn't in them, say so and answer from general knowledge, clearly flagging what came from the knowledge base vs. general knowledge. Be concise and cite memories inline as [n] when you use them.${who}
+Use the memories below as your primary source. If the answer isn't in them, say so and answer from general knowledge, clearly flagging what came from the knowledge base vs. general knowledge. Be concise and cite memories inline as [n] when you use them. When a memory lists a source (a file name and link), name that source in your answer and, if it has a link, include it so the user can open the original.${who}
 
 --- MEMORIES ---
 ${ctx}

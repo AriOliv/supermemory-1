@@ -60,6 +60,7 @@ export function register(deps: ToolDeps) {
 					text: getMemoryText(result),
 					similarity: result.similarity,
 					...(result.title ? { title: result.title } : {}),
+					...(result.source ? { source: result.source } : {}),
 				}))
 
 				if (searchResult.results.length > 0) {
@@ -67,7 +68,10 @@ export function register(deps: ToolDeps) {
 					for (const result of searchResult.results) {
 						const text = getMemoryText(result)
 						const similarity = (result.similarity * 100).toFixed(0)
-						parts.push(`- [${similarity}%] ${text}`)
+						const src = result.source
+							? ` — source: ${result.source.name ?? "document"}${result.source.url ? ` (${result.source.url})` : ""}`
+							: ""
+						parts.push(`- [${similarity}%] ${text}${src}`)
 					}
 				} else {
 					parts.push("\nNo matching memories found.")
