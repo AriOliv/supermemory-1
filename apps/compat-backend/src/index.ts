@@ -1,6 +1,7 @@
 import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { auth } from "./auth"
+import { chat } from "./chat"
 import { connectors } from "./connectors"
 
 /**
@@ -126,6 +127,9 @@ const guarded = async (c: any) => {
 // Knowledge-base connectors (Google Drive, ...) — real implementation, mounted
 // before the generic proxy so /v3/connections/* is handled here, not proxied/stubbed.
 app.route("/v3/connections", connectors)
+
+// RAG chat over the user's memories, powered by their LiteLLM proxy.
+app.route("/chat", chat)
 
 app.all("/v3/*", guarded)
 app.all("/v4/*", guarded)
