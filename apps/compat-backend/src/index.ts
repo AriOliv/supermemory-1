@@ -1,6 +1,7 @@
+import { oAuthDiscoveryMetadata } from "better-auth/plugins"
 import { Hono } from "hono"
 import { cors } from "hono/cors"
-import { auth } from "./auth"
+import { auth, authDb } from "./auth"
 import { chat } from "./chat"
 import { connectors } from "./connectors"
 
@@ -53,6 +54,13 @@ app.get("/", (c) => c.json({ ok: true, service: "supermemory-compat-backend" }))
 // better-auth (own CORS via trustedOrigins)
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw))
 
+// OAuth 2.0 Authorization Server discovery at the ROOT (issuer = baseURL). better-auth's
+// mcp plugin also serves this under /api/auth, but the MCP resource server and standard
+// clients expect it at the root of the issuer. Endpoints inside point to /api/auth/mcp/*.
+app.get("/.well-known/oauth-authorization-server", (c) =>
+	oAuthDiscoveryMetadata(auth)(c.req.raw),
+)
+
 // silence PostHog analytics beacons (the console proxies them via /orange/*)
 app.all("/orange/*", () => json({}))
 // Autumn billing is out of scope — return benign empties so the billing widgets don't crash.
@@ -66,10 +74,80 @@ async function getSession(c: { req: { raw: Request } }) {
 	}
 }
 
+// The opaque OAuth access token carries no org, so resolve the bearer user's earliest
+// org membership straight from the better-auth tables.
+function firstOrgId(userId: string): string | null {
+	try {
+		const row = authDb
+			.query(
+				"SELECT organizationId FROM member WHERE userId = ? ORDER BY createdAt ASC LIMIT 1",
+			)
+			.get(userId) as { organizationId?: string } | undefined
+		return row?.organizationId ?? null
+	} catch {
+		return null
+	}
+}
+
+function userInfo(userId: string): { email?: string; name?: string } {
+	try {
+		const row = authDb
+			.query("SELECT email, name FROM user WHERE id = ? LIMIT 1")
+			.get(userId) as { email?: string; name?: string } | undefined
+		return { email: row?.email, name: row?.name }
+	} catch {
+		return {}
+	}
+}
+
+// Container tags that exist in the lite store — used to scope MCP session/search.
+async function liteContainerTags(): Promise<string[]> {
+	try {
+		const res = await fetch(`${LITE_URL}/v3/container-tags/list`, {
+			headers: { authorization: `Bearer ${LITE_KEY}` },
+		})
+		if (!res.ok) return []
+		const data = (await res.json()) as
+			| Array<{ containerTag?: string; tag?: string }>
+			| { containerTags?: Array<{ containerTag?: string; tag?: string }> }
+		const arr = Array.isArray(data) ? data : (data.containerTags ?? [])
+		return arr
+			.map((t) => (typeof t === "string" ? t : (t.containerTag ?? t.tag)))
+			.filter((t): t is string => Boolean(t))
+	} catch {
+		return []
+	}
+}
+
+type Actor = { userId: string; organizationId: string; via: "cookie" | "bearer" }
+
+// Authenticate a request by console session cookie OR OAuth bearer (from the MCP Worker).
+async function resolveActor(c: { req: { raw: Request } }): Promise<Actor | null> {
+	const s = await getSession(c)
+	if (s?.user) {
+		const orgId =
+			s.session?.activeOrganizationId ?? firstOrgId(s.user.id) ?? s.user.id
+		return { userId: s.user.id, organizationId: orgId, via: "cookie" }
+	}
+	try {
+		const mcpSession = (await auth.api.getMcpSession({
+			headers: c.req.raw.headers,
+		})) as { userId?: string } | null
+		if (mcpSession?.userId) {
+			return {
+				userId: mcpSession.userId,
+				organizationId: firstOrgId(mcpSession.userId) ?? mcpSession.userId,
+				via: "bearer",
+			}
+		}
+	} catch {}
+	return null
+}
+
 // Endpoints the console calls on mount that the lite server does NOT implement.
 // Minimal shapes so the UI renders; refined iteratively against the real console.
 const STUBS: Record<string, () => Response> = {
-	"GET /v3/mcp/has-login": () => json({ hasLogin: false }),
+	"GET /v3/mcp/has-login": () => json({ hasLogin: true, previousLogin: true }),
 	"GET /v3/memory-of-day": () => json({ memory: null }),
 	"POST /v3/space-highlights": () => json({ highlights: [] }),
 	"GET /v3/analytics/memory": () => json({}),
@@ -119,8 +197,8 @@ async function proxyToLite(c: { req: { url: string; method: string; raw: Request
 }
 
 const guarded = async (c: any) => {
-	const session = await getSession(c)
-	if (!session) return json({ error: "Unauthorized" }, 401)
+	const actor = await resolveActor(c)
+	if (!actor) return json({ error: "Unauthorized" }, 401)
 	return proxyToLite(c)
 }
 
@@ -130,6 +208,22 @@ app.route("/v3/connections", connectors)
 
 // RAG chat over the user's memories, powered by their LiteLLM proxy.
 app.route("/chat", chat)
+
+// Identity for the MCP resource server (apps/mcp): bearer- or cookie-validated user +
+// the container tags to scope memory search. The patched Worker validator reads
+// `organization_id` from here (see apps/mcp/src/server/auth/index.ts).
+app.get("/v3/session", async (c) => {
+	const actor = await resolveActor(c)
+	if (!actor) return json({ error: "Unauthorized" }, 401)
+	const { email, name } = userInfo(actor.userId)
+	const tags = await liteContainerTags()
+	return json({
+		user: { id: actor.userId, email, name },
+		accessType: "full",
+		organization_id: actor.organizationId,
+		containerTags: tags.map((t) => ({ containerTag: t, permission: "write" })),
+	})
+})
 
 app.all("/v3/*", guarded)
 app.all("/v4/*", guarded)

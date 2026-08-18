@@ -1,4 +1,6 @@
-export const CHATGPT_REMOTE_MCP_URL = "https://mcp.supermemory.ai/mcp"
+// Self-hosted: point clients at our own MCP Worker via NEXT_PUBLIC_MCP_URL.
+export const CHATGPT_REMOTE_MCP_URL =
+	process.env.NEXT_PUBLIC_MCP_URL ?? "https://mcp.supermemory.ai/mcp"
 
 export const SUPERMEMORY_MCP_OAUTH_JSON = `{
   "mcpServers": {
@@ -20,14 +22,14 @@ export function buildMcpUrlRemoteJson() {
 	return `{
   "supermemory-mcp": {
     "command": "npx",
-    "args": ["-y", "mcp-remote@latest", "https://mcp.supermemory.ai/mcp"]
+    "args": ["-y", "mcp-remote@latest", "${CHATGPT_REMOTE_MCP_URL}"]
   }
 }`
 }
 
 export const CODEX_MCP_TOML = `[mcp_servers.supermemory]
 command = "npx"
-args = ["-y", "mcp-remote@latest", "https://mcp.supermemory.ai/mcp"]
+args = ["-y", "mcp-remote@latest", "${CHATGPT_REMOTE_MCP_URL}"]
 `
 
 /** Full file merge target: Claude Desktop `claude_desktop_config.json` → `mcpServers`. */
@@ -38,7 +40,7 @@ export const CLAUDE_DESKTOP_MCP_SNIPPET = `{
       "args": [
         "-y",
         "mcp-remote@latest",
-        "https://mcp.supermemory.ai/mcp"
+        "${CHATGPT_REMOTE_MCP_URL}"
       ]
     }
   }

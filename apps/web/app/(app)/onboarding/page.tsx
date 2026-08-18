@@ -539,7 +539,8 @@ export default function BrainOnboardingPage() {
 		}
 	}, [team.invites, org, goNext])
 
-	const mcpUrl = "https://mcp.supermemory.ai/mcp"
+	const mcpUrl =
+		process.env.NEXT_PUBLIC_MCP_URL ?? "https://mcp.supermemory.ai/mcp"
 
 	if (isCompanyBrain) {
 		return (

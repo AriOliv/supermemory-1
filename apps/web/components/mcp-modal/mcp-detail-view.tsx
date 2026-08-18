@@ -224,7 +224,7 @@ export function MCPSteps({ variant = "full" }: MCPStepsProps) {
 	}
 
 	function getMcpServerUrl() {
-		return "https://mcp.supermemory.ai/mcp"
+		return process.env.NEXT_PUBLIC_MCP_URL ?? "https://mcp.supermemory.ai/mcp"
 	}
 
 	function getMcpConfigSnippet() {
@@ -425,7 +425,10 @@ export function MCPSteps({ variant = "full" }: MCPStepsProps) {
 												servers over HTTPS.
 											</p>
 											<McpCodeBlock
-												code="https://mcp.supermemory.ai/mcp"
+												code={
+													process.env.NEXT_PUBLIC_MCP_URL ??
+													"https://mcp.supermemory.ai/mcp"
+												}
 												onCopy={() => {
 													analytics.mcpInstallCmdCopied()
 													toast.success("Copied to clipboard!")

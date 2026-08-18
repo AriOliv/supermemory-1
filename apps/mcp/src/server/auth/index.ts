@@ -1,4 +1,4 @@
-import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose"
+import type { JWTVerifyGetKey } from "jose"
 import { sessionInfoSchema, type SessionInfo } from "../../shared/types"
 
 const FETCH_TIMEOUT_MS = 30_000
@@ -10,21 +10,6 @@ export interface AuthUser {
 	oauthClientId?: string
 	scopes: string[]
 	expiresAt?: number
-}
-
-const remoteJwks = new Map<string, ReturnType<typeof createRemoteJWKSet>>()
-
-function authIssuer(apiUrl: string): string {
-	return `${apiUrl.replace(/\/+$/, "")}/api/auth`
-}
-
-function getRemoteJwks(jwksUrl: string) {
-	let keySet = remoteJwks.get(jwksUrl)
-	if (!keySet) {
-		keySet = createRemoteJWKSet(new URL(jwksUrl))
-		remoteJwks.set(jwksUrl, keySet)
-	}
-	return keySet
 }
 
 export async function fetchSession(
@@ -52,51 +37,47 @@ export async function fetchSession(
 	return result.data
 }
 
+// Self-hosted validation. better-auth's mcp plugin issues OPAQUE access tokens (DB rows),
+// not JWTs, so there is nothing to verify against JWKS. Instead we introspect the token by
+// calling the backend's GET /v3/session with it as a bearer; that endpoint resolves the user
+// and their organization. Signature kept (audience/keySet unused) so callers/tests still compile.
 export async function validateOAuthToken(
 	token: string,
 	apiUrl: string,
-	audience: string,
-	keySet?: JWTVerifyGetKey,
+	_audience: string,
+	_keySet?: JWTVerifyGetKey,
 ): Promise<AuthUser | null> {
 	try {
-		const issuer = authIssuer(apiUrl)
-		const verifier = keySet ?? getRemoteJwks(`${issuer}/jwks`)
-		const { payload } = await jwtVerify(token, verifier, {
-			issuer,
-			audience,
+		const response = await fetch(`${apiUrl.replace(/\/+$/, "")}/v3/session`, {
+			method: "GET",
+			headers: { Authorization: `Bearer ${token}` },
+			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 		})
-		if (typeof payload.sub !== "string" || payload.sub.length === 0) {
-			return null
+		if (!response.ok) return null
+
+		const data = (await response.json()) as {
+			user?: { id?: string }
+			organization_id?: string
+			scope?: unknown
+			scopes?: unknown
 		}
-		if (
-			typeof payload.organization_id !== "string" ||
-			payload.organization_id.length === 0
-		) {
+		const userId = data.user?.id
+		const organizationId = data.organization_id
+		if (typeof userId !== "string" || userId.length === 0) return null
+		if (typeof organizationId !== "string" || organizationId.length === 0) {
 			return null
 		}
 
-		const rawScopes = payload.scope ?? payload.scopes
+		const rawScopes = data.scope ?? data.scopes
 		const scopes = Array.isArray(rawScopes)
 			? rawScopes.filter((scope): scope is string => typeof scope === "string")
 			: typeof rawScopes === "string"
 				? rawScopes.split(/\s+/).filter(Boolean)
 				: []
 
-		return {
-			userId: payload.sub,
-			organizationId: payload.organization_id,
-			bearerToken: token,
-			oauthClientId:
-				typeof payload.azp === "string"
-					? payload.azp
-					: typeof payload.client_id === "string"
-						? payload.client_id
-						: undefined,
-			scopes,
-			expiresAt: payload.exp,
-		}
+		return { userId, organizationId, bearerToken: token, scopes }
 	} catch (error) {
-		console.error("OAuth token validation error:", error)
+		console.error("OAuth token introspection error:", error)
 		return null
 	}
 }

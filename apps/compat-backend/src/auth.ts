@@ -1,6 +1,13 @@
 import { Database } from "bun:sqlite"
 import { betterAuth, type BetterAuthOptions } from "better-auth"
-import { anonymous, apiKey, organization, username } from "better-auth/plugins"
+import {
+	anonymous,
+	apiKey,
+	jwt,
+	mcp,
+	organization,
+	username,
+} from "better-auth/plugins"
 
 /**
  * Self-hosted compatibility auth server for the Supermemory OSS console.
@@ -26,9 +33,18 @@ const TRUSTED_ORIGINS = (process.env.SM_COMPAT_TRUSTED_ORIGINS ?? "http://localh
 	.split(",")
 	.map((s) => s.trim())
 	.filter(Boolean)
+// OAuth authorize flow sends unauthenticated users here to log in (the console),
+// then back to complete the MCP client's authorization.
+const LOGIN_PAGE = process.env.SM_COMPAT_LOGIN_PAGE ?? "http://localhost:3939/login"
+// The MCP resource identifier advertised in OAuth discovery (the Worker's public /mcp URL).
+const MCP_RESOURCE = process.env.SM_MCP_RESOURCE ?? "http://localhost:8788/mcp"
+
+// Exported so the proxy can resolve a bearer user's organization directly from the
+// better-auth tables (getMcpSession returns only userId; org isn't in the opaque token).
+export const authDb = new Database(DB_PATH)
 
 export const authOptions = {
-	database: new Database(DB_PATH),
+	database: authDb,
 	baseURL: BASE_URL,
 	secret: SECRET,
 	trustedOrigins: TRUSTED_ORIGINS,
@@ -41,7 +57,17 @@ export const authOptions = {
 		// Must match the prefixes apps/web/middleware.ts checks for.
 		cookiePrefix: "better-auth",
 	},
-	plugins: [organization(), apiKey(), username(), anonymous()],
+	// jwt() exposes /api/auth/jwks (completes the OAuth AS metadata); mcp() wraps
+	// oidcProvider to serve OAuth2 discovery, dynamic client registration, authorize/token
+	// and /api/auth/mcp/* — making this backend the AS the official MCP Worker delegates to.
+	plugins: [
+		organization(),
+		apiKey(),
+		username(),
+		anonymous(),
+		jwt(),
+		mcp({ loginPage: LOGIN_PAGE, resource: MCP_RESOURCE }),
+	],
 } satisfies BetterAuthOptions
 
 export const auth = betterAuth(authOptions)

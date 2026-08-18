@@ -248,7 +248,7 @@ export function ConnectAIModal({
 	}, [selectedClient, setupTab])
 
 	function getMcpServerUrl() {
-		return "https://mcp.supermemory.ai/mcp"
+		return process.env.NEXT_PUBLIC_MCP_URL ?? "https://mcp.supermemory.ai/mcp"
 	}
 
 	function getMcpConfigSnippet() {

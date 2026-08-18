@@ -61,7 +61,10 @@ function resourceMetadata(c: Context<{ Bindings: Bindings }>) {
 
 	return c.json({
 		resource: mcpResource,
-		authorization_servers: [`${apiUrl.replace(/\/+$/, "")}/api/auth`],
+		// Self-hosted better-auth reports its issuer as the API base (root), and serves
+		// /.well-known/oauth-authorization-server there — so advertise the root as the AS
+		// (was `${apiUrl}/api/auth`, which mismatched the issuer in the served metadata).
+		authorization_servers: [apiUrl.replace(/\/+$/, "")],
 		scopes_supported: ["openid", "profile", "email", "offline_access"],
 		bearer_methods_supported: ["header"],
 		resource_documentation: "https://supermemory.ai/docs/supermemory-mcp/mcp",
@@ -169,9 +172,13 @@ async function handleMcpRequest(
 
 	const reqHost = c.req.header("x-forwarded-host") || c.req.header("host") || ""
 	const reqProto = c.req.header("x-forwarded-proto") || "https"
-	const resourceMetadataUrl = reqHost
-		? `${reqProto}://${reqHost}${PROTECTED_RESOURCE_METADATA_PATH}`
-		: PROTECTED_RESOURCE_METADATA_PATH
+	// Prefer an explicit public origin when set (lets local http dev advertise
+	// http://localhost:PORT instead of the https default inferred from the Host header).
+	const resourceMetadataUrl = c.env.MCP_PUBLIC_ORIGIN
+		? `${c.env.MCP_PUBLIC_ORIGIN.replace(/\/+$/, "")}${PROTECTED_RESOURCE_METADATA_PATH}`
+		: reqHost
+			? `${reqProto}://${reqHost}${PROTECTED_RESOURCE_METADATA_PATH}`
+			: PROTECTED_RESOURCE_METADATA_PATH
 	const mcpOrigin = c.env.MCP_PUBLIC_ORIGIN || new URL(mcpResource).origin
 
 	if (!token) return unauthorizedResponse(resourceMetadataUrl)
