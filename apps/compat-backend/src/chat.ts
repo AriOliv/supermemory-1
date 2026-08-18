@@ -108,20 +108,67 @@ async function searchOne(query: string, containerTag: string): Promise<Retrieved
 	}
 }
 
-// Retrieve relevant memories to ground the answer. The lite /v4/search treats multiple
-// containerTags as AND (a memory must be in all of them) → 0 hits across spaces, so we query
-// each space separately and merge the top results by similarity.
+// Document/chunk search (/v3) for a single tag. Unlike /v4 (extracted memories), this covers
+// EVERY ingested document — including tabular/dense docs (e.g. spreadsheets) that don't
+// extract into memories — so the chat can answer from them and cite the source file/link.
+async function searchDocuments(query: string, containerTag: string): Promise<Retrieved[]> {
+	try {
+		const res = await fetch(`${LITE_URL}/v3/search`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${LITE_KEY}`, "content-type": "application/json" },
+			body: JSON.stringify({ q: query, containerTags: [containerTag], limit: 6 }),
+		})
+		if (!res.ok) return []
+		const data = (await res.json()) as {
+			results?: Array<{
+				chunks?: Array<{ content?: string; isRelevant?: boolean }>
+				metadata?: { name?: string; url?: string } | null
+				score?: number
+				title?: string
+			}>
+		}
+		return (data.results ?? [])
+			.map((r) => {
+				const chunks = r.chunks ?? []
+				const relevant = chunks.filter((c) => c.isRelevant && c.content)
+				const picked = (relevant.length ? relevant : chunks).slice(0, 2)
+				const text = picked
+					.map((c) => c.content)
+					.filter(Boolean)
+					.join(" … ")
+					.trim()
+				return {
+					text,
+					name: r.metadata?.name ?? r.title ?? undefined,
+					url: r.metadata?.url,
+					similarity: r.score ?? 0,
+				}
+			})
+			.filter((r) => r.text)
+	} catch {
+		return []
+	}
+}
+
+// Retrieve relevant context to ground the answer. Queries BOTH memory search (/v4, extracted
+// facts) and document search (/v3, raw chunks) per space, since /v4 misses docs that don't
+// extract into memories. The lite /v4/search also treats multiple containerTags as AND (0 hits
+// across spaces), so each space is queried separately; results are merged and ranked, and each
+// carries its source (file name + link) for citation.
 async function retrieveContext(query: string, containerTags: string[]): Promise<Retrieved[]> {
 	if (!query || containerTags.length === 0) return []
-	const perTag = await Promise.all(containerTags.map((t) => searchOne(query, t)))
-	const merged = perTag.flat().sort((a, b) => b.similarity - a.similarity)
+	const batches = await Promise.all(
+		containerTags.flatMap((t) => [searchOne(query, t), searchDocuments(query, t)]),
+	)
+	const merged = batches.flat().sort((a, b) => b.similarity - a.similarity)
 	const seen = new Set<string>()
 	const out: Retrieved[] = []
 	for (const r of merged) {
-		if (seen.has(r.text)) continue
-		seen.add(r.text)
+		const key = r.text.slice(0, 120).toLowerCase()
+		if (seen.has(key)) continue
+		seen.add(key)
 		out.push(r)
-		if (out.length >= 8) break
+		if (out.length >= 10) break
 	}
 	return out
 }
