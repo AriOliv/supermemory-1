@@ -133,11 +133,45 @@ app.route("/chat", chat)
 
 app.all("/v3/*", guarded)
 app.all("/v4/*", guarded)
-app.all("/brain/*", async (c: any) => {
-	const session = await getSession(c)
-	if (!session) return json({ error: "Unauthorized" }, 401)
-	return json({}) // Company Brain stubbed for now
+// Company Brain (org-wide brain over the shared memory store). Self-hosted has no billing,
+// so the trial gate is reported active; Slack/automations/research are stubbed empty.
+app.use("/brain/*", async (c, next) => {
+	const s = await getSession(c)
+	if (!s) return json({ error: "Unauthorized" }, 401)
+	await next()
 })
+// Trial gate — always active so the console skips the Stripe paywall.
+app.get("/brain/trial/status", () => json({ active: true, reason: null }))
+app.post("/brain/trial/start", () => json({ status: "attached" }))
+// Feature surfaces (empty-but-valid shapes so the UI renders).
+app.get("/brain/slack/status", () => json({ connected: false }))
+app.get("/brain/skills", () => json({ skills: [] }))
+app.get("/brain/mcp-connections", () => json({ connections: [] }))
+app.get("/brain/models", () => json({ models: [] }))
+app.get("/brain/settings", () => json({}))
+// No company-research pipeline self-hosted: report "done" immediately with no findings so the
+// onboarding transcript renders (needs `events`) and completes instead of polling forever.
+app.get("/brain/research/status", () =>
+	json({ status: "done", domain: null, findings: 0, events: [] }),
+)
+app.post("/brain/research/start", () => json({ status: "done" }))
+// BrainHomeView reads nested objects (slack/connections/members/research) with an unguarded
+// `overview.data?.slack.connected`, so each nested object must be present or the page crashes.
+app.get("/brain/overview", async (c) => {
+	let members = 0
+	try {
+		const full = await auth.api.getFullOrganization({ headers: c.req.raw.headers })
+		members = (full as { members?: unknown[] } | null)?.members?.length ?? 0
+	} catch {}
+	return json({
+		research: { status: "done" },
+		slack: { connected: false, teamName: null, rollout: null },
+		connections: { apps: 0 },
+		members: { count: members },
+	})
+})
+app.get("/brain/company-summary", () => json({}))
+app.all("/brain/*", () => json({}))
 
 console.log(`[compat] :${PORT}  lite=${LITE_URL}  origins=${ORIGINS.join(",")}`)
 export default { port: PORT, fetch: app.fetch }

@@ -69,15 +69,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		[refetchOrgsQuery],
 	)
 
-	const setActiveOrg = useCallback(async (slug: string) => {
-		if (!slug) return
-
-		const res = await authClient.organization.setActive({
-			organizationSlug: slug,
-		})
-		setOrg(res?.data ?? null)
-		localStorage.setItem(STORAGE_KEY, slug)
-	}, [])
+	const setActiveOrg = useCallback(
+		async (slug: string) => {
+			if (!slug) return
+			// setActive by slug is unreliable against the self-hosted backend; resolve the
+			// slug to an org id from the loaded list and set by id (avoids a 403 retry loop).
+			const orgId = organizations?.find((o) => o.slug === slug)?.id
+			const res = await authClient.organization.setActive(
+				orgId ? { organizationId: orgId } : { organizationSlug: slug },
+			)
+			setOrg(res?.data ?? null)
+			localStorage.setItem(STORAGE_KEY, slug)
+		},
+		[organizations],
+	)
 
 	const clearActiveOrg = useCallback(async () => {
 		try {
