@@ -1,0 +1,8 @@
+.env
+*.sqlite
+*.sqlite-*
+compat.sqlite*
+node_modules
+
+# transient dev logs
+*.log
