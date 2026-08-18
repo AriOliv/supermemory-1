@@ -94,14 +94,18 @@ async function retrieveContext(query: string, containerTags: string[]): Promise<
 	}
 }
 
-function systemPrompt(memories: string[]): string {
+function systemPrompt(memories: string[], user?: { name?: string; email?: string }): string {
+	const who =
+		user?.name || user?.email
+			? `\nThe person you are talking to is ${user?.name ?? "the user"}${user?.email ? ` (${user.email})` : ""}. Use this when they ask about themselves.`
+			: ""
 	if (memories.length === 0) {
-		return "You are Supermemory, a helpful assistant with access to the user's personal knowledge base. The knowledge base returned no relevant memories for this question, so answer from general knowledge and say when you are unsure."
+		return `You are Supermemory, a helpful assistant with access to the user's personal knowledge base. No relevant memories were found for this question, so answer from general knowledge and say when you are unsure.${who}`
 	}
 	const ctx = memories.map((m, i) => `[${i + 1}] ${m}`).join("\n")
 	return `You are Supermemory, a helpful assistant that answers using the user's personal knowledge base (memories synced from their sources, e.g. Google Drive).
 
-Use the memories below as your primary source. If the answer isn't in them, say so and answer from general knowledge, clearly flagging what came from the knowledge base vs. general knowledge. Be concise and cite memories inline as [n] when you use them.
+Use the memories below as your primary source. If the answer isn't in them, say so and answer from general knowledge, clearly flagging what came from the knowledge base vs. general knowledge. Be concise and cite memories inline as [n] when you use them.${who}
 
 --- MEMORIES ---
 ${ctx}
@@ -121,9 +125,12 @@ async function requireUser(c: { req: { raw: Request } }) {
 
 // Main chat endpoint — POST /chat
 chat.post("/", async (c) => {
-	const userId = await requireUser(c)
-	if (!userId) return jsonError("Unauthorized", 401)
+	const session = await auth.api
+		.getSession({ headers: c.req.raw.headers })
+		.catch(() => null)
+	if (!session?.user) return jsonError("Unauthorized", 401)
 	if (!LLM_KEY) return jsonError("LLM not configured (SM_LLM_API_KEY)", 503)
+	const user = session.user as { name?: string; email?: string }
 
 	const body = (await c.req.json().catch(() => ({}))) as {
 		messages?: UIMessage[]
@@ -142,7 +149,7 @@ chat.post("/", async (c) => {
 
 	const result = streamText({
 		model: llm.chat(CHAT_MODEL),
-		system: systemPrompt(memories),
+		system: systemPrompt(memories, user),
 		messages: toModelMessages(messages),
 	})
 	return result.toUIMessageStreamResponse()
