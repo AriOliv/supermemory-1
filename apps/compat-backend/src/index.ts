@@ -4,6 +4,7 @@ import { cors } from "hono/cors"
 import { auth, authDb } from "./auth"
 import { chat } from "./chat"
 import { connectors } from "./connectors"
+import { slack, slackStatusForOrg } from "./slack"
 
 /**
  * Compatibility backend for the Supermemory OSS console.
@@ -227,9 +228,17 @@ app.get("/v3/session", async (c) => {
 
 app.all("/v3/*", guarded)
 app.all("/v4/*", guarded)
+
+// Company Brain Slack bot — mounted BEFORE the /brain/* session guard because Slack's
+// server-to-server calls (events, oauth callback) carry no session cookie. The sub-app
+// authenticates each route itself (session / HMAC signature / signed OAuth state).
+app.route("/brain/slack", slack)
+
 // Company Brain (org-wide brain over the shared memory store). Self-hosted has no billing,
-// so the trial gate is reported active; Slack/automations/research are stubbed empty.
+// so the trial gate is reported active; automations/research are stubbed empty.
 app.use("/brain/*", async (c, next) => {
+	// /brain/slack/* is served by the sub-app above with its own auth — don't cookie-gate it.
+	if (c.req.path.startsWith("/brain/slack/")) return next()
 	const s = await getSession(c)
 	if (!s) return json({ error: "Unauthorized" }, 401)
 	await next()
@@ -237,8 +246,7 @@ app.use("/brain/*", async (c, next) => {
 // Trial gate — always active so the console skips the Stripe paywall.
 app.get("/brain/trial/status", () => json({ active: true, reason: null }))
 app.post("/brain/trial/start", () => json({ status: "attached" }))
-// Feature surfaces (empty-but-valid shapes so the UI renders).
-app.get("/brain/slack/status", () => json({ connected: false }))
+// Feature surfaces (empty-but-valid shapes so the UI renders). /brain/slack/* is the sub-app.
 app.get("/brain/skills", () => json({ skills: [] }))
 app.get("/brain/mcp-connections", () => json({ connections: [] }))
 app.get("/brain/models", () => json({ models: [] }))
@@ -253,13 +261,25 @@ app.post("/brain/research/start", () => json({ status: "done" }))
 // `overview.data?.slack.connected`, so each nested object must be present or the page crashes.
 app.get("/brain/overview", async (c) => {
 	let members = 0
+	let orgId: string | null = null
 	try {
-		const full = await auth.api.getFullOrganization({ headers: c.req.raw.headers })
-		members = (full as { members?: unknown[] } | null)?.members?.length ?? 0
+		const full = (await auth.api.getFullOrganization({ headers: c.req.raw.headers })) as
+			| { id?: string; members?: unknown[] }
+			| null
+		members = full?.members?.length ?? 0
+		orgId = full?.id ?? null
 	} catch {}
+	// Fall back to the session's earliest org membership when no org is active.
+	if (!orgId) {
+		const s = await getSession(c)
+		if (s?.user) orgId = s.session?.activeOrganizationId ?? firstOrgId(s.user.id) ?? s.user.id
+	}
+	const slackStatus = orgId
+		? slackStatusForOrg(orgId)
+		: { connected: false, teamName: null, rollout: null }
 	return json({
 		research: { status: "done" },
-		slack: { connected: false, teamName: null, rollout: null },
+		slack: slackStatus,
 		connections: { apps: 0 },
 		members: { count: members },
 	})
