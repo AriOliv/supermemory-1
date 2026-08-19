@@ -52,6 +52,9 @@ const socialProviders =
 	GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET
 		? { google: { clientId: GOOGLE_CLIENT_ID, clientSecret: GOOGLE_CLIENT_SECRET } }
 		: {}
+// Prod only: share the session cookie across subdomains (console + API on *.os.avenia.tech).
+// Unset in local dev, so the default localhost-friendly cookie is kept there.
+const COOKIE_DOMAIN = process.env.SM_COMPAT_COOKIE_DOMAIN ?? ""
 
 // Exported so the proxy can resolve a bearer user's organization directly from the
 // better-auth tables (getMcpSession returns only userId; org isn't in the opaque token).
@@ -84,6 +87,20 @@ export const authOptions = {
 	advanced: {
 		// Must match the prefixes apps/web/middleware.ts checks for.
 		cookiePrefix: "better-auth",
+		// When deployed across subdomains (console os.avenia.tech + API api.os.avenia.tech),
+		// scope the session cookie to the shared parent so the console origin's requests carry
+		// it to the API. Empty in dev → keep the localhost default (no Secure/domain).
+		...(COOKIE_DOMAIN
+			? {
+					useSecureCookies: true,
+					crossSubDomainCookies: { enabled: true, domain: COOKIE_DOMAIN },
+					defaultCookieAttributes: {
+						sameSite: "Lax" as const,
+						secure: true,
+						domain: COOKIE_DOMAIN,
+					},
+				}
+			: {}),
 	},
 	// jwt() exposes /api/auth/jwks (completes the OAuth AS metadata); mcp() wraps
 	// oidcProvider to serve OAuth2 discovery, dynamic client registration, authorize/token
