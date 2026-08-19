@@ -43,34 +43,49 @@ settings:
 > Sem `event_subscriptions` de propósito: o Slack só verifica a Events URL quando o endpoint
 > já está no ar com o Signing Secret. Ligamos os eventos no passo 4, depois do deploy.
 
-## 2) Pegar as credenciais
+## 2) Signing Secret na VM (sempre necessário)
 
-Em **Basic Information → App Credentials**: copie **Client ID**, **Client Secret** e
-**Signing Secret**.
-
-## 3) Colocar os segredos na VM e reiniciar
-
-No `.env` do compat na VM (`/opt/supermemory-app/apps/compat-backend/.env`), acrescente
-(substitua pelos valores reais — segredos NUNCA vão pro git/Notion):
+Em **Basic Information → App Credentials**, copie o **Signing Secret**. No `.env` do compat na
+VM (`/opt/supermemory-app/apps/compat-backend/.env`), acrescente (segredos NUNCA vão pro
+git/Notion):
 
 ```bash
-SLACK_CLIENT_ID=...
-SLACK_CLIENT_SECRET=...
 SLACK_SIGNING_SECRET=...
 SLACK_EXTRACTION_MODE=durable   # durable (padrão) | all | on-demand
 ```
 
-Depois: `sudo systemctl restart supermemory-compat`.
+## 3) Conectar o bot token — escolha A ou B
 
-## 4) Ligar os eventos e instalar
+O App-Level token (`xapp-…`) **não é usado** (é só pra Socket Mode). O bot token (`xoxb-…`)
+vem por um destes caminhos:
+
+**A) OAuth "Add to Slack" (multi-workspace):** copie Client ID/Secret e adicione ao `.env`:
+```bash
+SLACK_CLIENT_ID=...
+SLACK_CLIENT_SECRET=...
+```
+Depois de ligar os eventos (passo 4), instale pelo console: **Company Brain → Add to Slack**
+(o `xoxb` é buscado e guardado automaticamente).
+
+**B) Colar o token (1 workspace, mais simples):** no app Slack → **OAuth & Permissions** →
+**Install to Workspace** → copie o **Bot User OAuth Token** (`xoxb-…`) e adicione ao `.env`:
+```bash
+SLACK_BOT_TOKEN=xoxb-...
+# SLACK_ORG_ID=   # opcional; senão usa a org mais antiga do banco
+```
+Sem Client ID/Secret nem botão OAuth — o install é registrado sozinho a partir do token.
+
+Reinicie após editar o `.env`: `sudo systemctl restart supermemory-compat`.
+
+## 4) Ligar os eventos
 
 1. No app Slack → **Event Subscriptions** → Enable → **Request URL**:
    `https://api.os.avenia.tech/brain/slack/events` → deve dar **Verified** ✅.
 2. **Subscribe to bot events**: `app_mention`, `message.channels`, `message.groups`,
-   `message.im` → **Save Changes**.
-3. Instale pelo console: **Company Brain → Add to Slack** (abre
-   `/brain/slack/oauth/install`, passa pela tela do Slack e volta com `?slack=connected`).
-   `GET /brain/slack/status` deve retornar `{connected:true}`.
+   `message.im` → **Save Changes** (reinstale se o Slack pedir).
+
+`GET /brain/slack/status` deve retornar `{connected:true}` (opção B: já após o restart;
+opção A: após o "Add to Slack").
 
 ## 5) Testar
 

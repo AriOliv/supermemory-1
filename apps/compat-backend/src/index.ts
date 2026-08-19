@@ -4,7 +4,7 @@ import { cors } from "hono/cors"
 import { auth, authDb } from "./auth"
 import { chat } from "./chat"
 import { connectors } from "./connectors"
-import { slack, slackStatusForOrg } from "./slack"
+import { ensureDirectInstall, slack, slackStatusForOrg } from "./slack"
 
 /**
  * Compatibility backend for the Supermemory OSS console.
@@ -274,6 +274,7 @@ app.get("/brain/overview", async (c) => {
 		const s = await getSession(c)
 		if (s?.user) orgId = s.session?.activeOrganizationId ?? firstOrgId(s.user.id) ?? s.user.id
 	}
+	await ensureDirectInstall() // register the direct-token install if SLACK_BOT_TOKEN is set
 	const slackStatus = orgId
 		? slackStatusForOrg(orgId)
 		: { connected: false, teamName: null, rollout: null }

@@ -39,6 +39,12 @@ const SECRET =
 const SLACK_CLIENT_ID = process.env.SLACK_CLIENT_ID ?? ""
 const SLACK_CLIENT_SECRET = process.env.SLACK_CLIENT_SECRET ?? ""
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET ?? ""
+// Single-workspace shortcut: paste the bot token (xoxb-…) instead of running the OAuth
+// "Add to Slack" flow. When set, the install row is auto-created for the org from the token
+// (team + bot user resolved via auth.test). No Client ID/Secret or OAuth redirect needed.
+// The App-Level token (xapp-…) is NOT used — that's only for Socket Mode; we use HTTP events.
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? ""
+const SLACK_ORG_ID = process.env.SLACK_ORG_ID ?? "" // optional; else the earliest org is used
 // Bot scopes requested at install — MUST match the Slack app manifest.
 const SLACK_SCOPES = [
 	"app_mentions:read",
@@ -129,6 +135,54 @@ function installForOrg(orgId: string): Install | null {
 }
 function installForTeam(teamId: string): Install | null {
 	return (db.query("SELECT * FROM sm_slack_install WHERE team_id=?").get(teamId) as Install | null) ?? null
+}
+
+// The org to attach a direct-token install to (single-workspace mode): SLACK_ORG_ID if given,
+// else the earliest organization in the DB (there's one for a single-org test).
+function defaultOrgId(): string | null {
+	if (SLACK_ORG_ID) return SLACK_ORG_ID
+	try {
+		const row = authDb.query("SELECT id FROM organization ORDER BY createdAt ASC LIMIT 1").get() as
+			| { id?: string }
+			| undefined
+		return row?.id ?? null
+	} catch {
+		return null
+	}
+}
+
+// When SLACK_BOT_TOKEN is set (paste-the-token mode), auto-register the install once by
+// resolving the team/bot-user from the token via auth.test. Idempotent; safe to call often.
+let directInstallDone = false
+export async function ensureDirectInstall(): Promise<void> {
+	if (directInstallDone || !SLACK_BOT_TOKEN) return
+	directInstallDone = true // optimistic; reset on failure so a later call retries
+	try {
+		const test = await slackCall<{ ok?: boolean; team_id?: string; team?: string; user_id?: string }>(
+			SLACK_BOT_TOKEN,
+			"auth.test",
+			{},
+		)
+		if (!test?.ok || !test.team_id) {
+			directInstallDone = false
+			return
+		}
+		const orgId = defaultOrgId()
+		if (!orgId) {
+			console.warn("[slack] SLACK_BOT_TOKEN set but no organization found to attach to")
+			return
+		}
+		db.query(
+			`INSERT INTO sm_slack_install (team_id, bot_token, bot_user_id, team_name, org_id, installed_by, created_at)
+       VALUES (?,?,?,?,?,?,?)
+       ON CONFLICT(team_id) DO UPDATE SET bot_token=excluded.bot_token, bot_user_id=excluded.bot_user_id,
+         team_name=excluded.team_name, org_id=excluded.org_id`,
+		).run(test.team_id, SLACK_BOT_TOKEN, test.user_id ?? null, test.team ?? null, orgId, "direct-token", nowIso())
+		console.log(`[slack] direct-token install for team ${test.team} (${test.team_id}) → org ${orgId}`)
+	} catch (e) {
+		directInstallDone = false
+		console.error("[slack] ensureDirectInstall failed:", e instanceof Error ? e.message : e)
+	}
 }
 
 // ---- org resolution (mirrors index.ts) ----
@@ -452,6 +506,7 @@ const json = (data: unknown, status = 200) =>
 slack.get("/status", async (c) => {
 	const sess = await sessionOrg(c)
 	if (!sess) return json({ error: "Unauthorized" }, 401)
+	await ensureDirectInstall()
 	const inst = installForOrg(sess.orgId)
 	return json({ connected: Boolean(inst), teamName: inst?.team_name ?? null })
 })
@@ -547,6 +602,7 @@ slack.post("/events", async (c) => {
 			processed.add(evtId)
 			if (processed.size > 5000) processed.clear()
 		}
+		await ensureDirectInstall()
 		const inst = installForTeam(payload.team_id)
 		if (inst) {
 			handleEvent(inst, payload.event).catch((e) =>
@@ -580,3 +636,7 @@ export function slackStatusForOrg(orgId: string): { connected: boolean; teamName
 	const inst = installForOrg(orgId)
 	return { connected: Boolean(inst), teamName: inst?.team_name ?? null, rollout: null }
 }
+
+// Single-workspace bootstrap: if a bot token was pasted, register the install on startup so
+// /status and /overview report connected without waiting for the first event.
+ensureDirectInstall().catch(() => {})
