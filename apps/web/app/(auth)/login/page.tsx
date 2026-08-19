@@ -532,6 +532,54 @@ export default function LoginPage() {
 													/>
 												</div>
 											) : null}
+											{process.env.NEXT_PUBLIC_SSO_ENABLED ? (
+												<div className="w-full">
+													<ExternalAuthButton
+														authIcon={
+															<svg
+																className="size-4 sm:size-5 text-foreground"
+																fill="none"
+																height="24"
+																viewBox="0 0 24 24"
+																width="24"
+																xmlns="http://www.w3.org/2000/svg"
+															>
+																<title>SSO</title>
+																<path
+																	d="M7 10V7a5 5 0 0 1 10 0v3h1a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h1Zm2 0h6V7a3 3 0 1 0-6 0v3Z"
+																	fill="currentColor"
+																/>
+															</svg>
+														}
+														authProvider="SSO"
+														className="w-full"
+														disabled={Boolean(loadingMessage)}
+														onClick={() => {
+															if (loadingMessage) return
+															if (!email || !email.includes("@")) {
+																setError(
+																	"Digite seu e-mail corporativo acima para entrar via SSO.",
+																)
+																return
+															}
+															setIsLoading(true)
+															posthog.capture("login_attempt", {
+																method: "sso",
+																email_domain: email.split("@")[1] || "unknown",
+															})
+															signIn
+																.sso({
+																	callbackURL: getCallbackURL(),
+																	email,
+																})
+																.catch((err: unknown) => {
+																	setError(getErrorMessage(err))
+																	setIsLoading(false)
+																})
+														}}
+													/>
+												</div>
+											) : null}
 											{process.env.NEXT_PUBLIC_HOST_ID === "supermemory" ||
 											!process.env.NEXT_PUBLIC_GITHUB_AUTH_ENABLED ? (
 												<div className="w-full">
