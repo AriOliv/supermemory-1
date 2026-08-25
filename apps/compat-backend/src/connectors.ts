@@ -32,6 +32,9 @@ const DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 const GRANOLA_API = (process.env.SM_GRANOLA_API_URL ?? "https://public-api.granola.ai/v1").replace(/\/+$/, "")
 const GRANOLA_INCLUDE_TRANSCRIPT = process.env.SM_GRANOLA_INCLUDE_TRANSCRIPT === "true"
 
+// Periodic auto re-sync of every connected connection (Drive + Granola). 0 disables it.
+const RESYNC_INTERVAL_HOURS = Number(process.env.SM_RESYNC_INTERVAL_HOURS ?? 4)
+
 const db = new Database(DB_PATH)
 db.exec(`
   CREATE TABLE IF NOT EXISTS sm_connection (
@@ -469,6 +472,35 @@ async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cro
 		).run("failed", nowIso(), processed, failed, e instanceof Error ? e.message : String(e), runId)
 		console.error(`[connector] granola sync ${connId} failed:`, e)
 	}
+}
+
+// ---------- periodic auto re-sync ----------
+// Re-sync every connected connection once, sequentially (so a tick never overlaps itself).
+// Each sync is incremental + idempotent (upsert by customId), so this is cheap and safe.
+async function resyncAll() {
+	const rows = db
+		.query("SELECT id, provider FROM sm_connection WHERE status='connected'")
+		.all() as { id: string; provider: string }[]
+	if (rows.length === 0) return
+	console.log(`[connector] cron resync: ${rows.length} connection(s)`)
+	for (const r of rows) {
+		try {
+			if (r.provider === "granola") await runGranolaSync(r.id, "cron")
+			else if (r.provider === "google-drive") await runSync(r.id, "cron")
+		} catch (e) {
+			console.error(`[connector] cron resync ${r.id} failed:`, e instanceof Error ? e.message : e)
+		}
+	}
+}
+
+let resyncTimer: ReturnType<typeof setInterval> | null = null
+// Started once from index.ts on boot. First pass ~60s after boot (freshen + verifiable),
+// then every SM_RESYNC_INTERVAL_HOURS. Set the interval to 0 to disable.
+export function startResyncScheduler() {
+	if (resyncTimer || !(RESYNC_INTERVAL_HOURS > 0)) return
+	console.log(`[connector] resync scheduler: every ${RESYNC_INTERVAL_HOURS}h`)
+	setTimeout(() => resyncAll().catch(() => {}), 60_000)
+	resyncTimer = setInterval(() => resyncAll().catch(() => {}), RESYNC_INTERVAL_HOURS * 3_600_000)
 }
 
 // ---------- HTTP routes (mounted at /v3/connections) ----------

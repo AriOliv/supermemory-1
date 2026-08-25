@@ -3,7 +3,7 @@ import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { auth, authDb } from "./auth"
 import { chat } from "./chat"
-import { connectors } from "./connectors"
+import { connectors, startResyncScheduler } from "./connectors"
 import { ensureDirectInstall, slack, slackStatusForOrg } from "./slack"
 
 /**
@@ -289,4 +289,6 @@ app.get("/brain/company-summary", () => json({}))
 app.all("/brain/*", () => json({}))
 
 console.log(`[compat] :${PORT}  lite=${LITE_URL}  origins=${ORIGINS.join(",")}`)
+// Periodic auto re-sync of knowledge-base connectors (Drive + Granola).
+startResyncScheduler()
 export default { port: PORT, fetch: app.fetch }
