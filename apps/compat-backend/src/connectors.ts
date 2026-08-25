@@ -288,12 +288,16 @@ async function runSync(connId: string, trigger: "manual" | "event" | "cron") {
 // ---------- Granola ----------
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+// The list endpoint returns only metadata (id/title/dates); the content (summary_markdown,
+// web_url, attendees, transcript) lives in the per-note detail (GET /v1/notes/{id}).
 type GranolaNote = {
 	id: string
 	title?: string
-	url?: string
+	web_url?: string
 	owner?: { name?: string; email?: string }
-	summary?: unknown // AI note; string or structured — stringified defensively
+	attendees?: Array<{ name?: string; email?: string }>
+	summary_markdown?: string
+	summary_text?: string
 	transcript?: unknown
 	created_at?: string
 }
@@ -355,10 +359,24 @@ async function granolaListNotes(
 	}
 }
 
+// Full note detail — the list omits the content, so fetch each note for summary_markdown etc.
+async function granolaGetNote(apiKey: string, id: string): Promise<GranolaNote | null> {
+	const res = await fetch(`${GRANOLA_API}/notes/${encodeURIComponent(id)}`, {
+		headers: { authorization: `Bearer ${apiKey}` },
+	})
+	if (res.status === 429) {
+		await sleep(2000)
+		return granolaGetNote(apiKey, id)
+	}
+	if (res.status === 404) return null
+	if (!res.ok) throw new Error(`granola get note failed: ${res.status}`)
+	return (await res.json()) as GranolaNote
+}
+
 function granolaNoteToContent(n: GranolaNote): string {
 	const parts: string[] = []
 	if (n.title) parts.push(`# ${n.title}`)
-	const summary = typeof n.summary === "string" ? n.summary : n.summary ? JSON.stringify(n.summary) : ""
+	const summary = n.summary_markdown || n.summary_text || ""
 	if (summary) parts.push(summary)
 	if (GRANOLA_INCLUDE_TRANSCRIPT && n.transcript) {
 		const t = Array.isArray(n.transcript)
@@ -397,33 +415,35 @@ async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cro
 				createdAfter,
 			})
 			if (!logged && notes[0]) {
-				// One-time shape probe (the docs list fields but not exact types).
-				console.log(
-					`[connector] granola note keys: ${Object.keys(notes[0]).join(",")} summaryType=${typeof notes[0].summary}`,
-				)
+				console.log(`[connector] granola list item keys: ${Object.keys(notes[0]).join(",")}`)
 				logged = true
 			}
-			for (const n of notes) {
+			for (const meta of notes) {
 				try {
-					const content = granolaNoteToContent(n)
+					const d = await granolaGetNote(r.access_token, meta.id)
+					if (!d) continue
+					const content = granolaNoteToContent(d)
 					if (!content) continue
 					await ingest(
 						content,
 						tags,
 						{
 							source: "granola",
-							name: n.title ?? "Granola note",
-							noteId: n.id,
-							owner: n.owner?.email,
-							createdAt: n.created_at,
-							...(n.url ? { url: n.url } : {}),
+							name: d.title ?? meta.title ?? "Granola note",
+							noteId: d.id,
+							owner: d.owner?.email,
+							createdAt: d.created_at ?? meta.created_at,
+							...(d.web_url ? { url: d.web_url } : {}),
+							...(d.attendees?.length
+								? { attendees: d.attendees.map((a) => a.email || a.name).filter(Boolean) }
+								: {}),
 						},
-						`granola:${n.id}`,
+						`granola:${d.id}`,
 					)
 					processed++
 				} catch (e) {
 					failed++
-					console.error(`[connector] granola note ${n.id} failed:`, e instanceof Error ? e.message : e)
+					console.error(`[connector] granola note ${meta.id} failed:`, e instanceof Error ? e.message : e)
 				}
 				await sleep(250) // throttle (well under the 5 req/s Granola limit)
 			}
