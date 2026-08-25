@@ -461,7 +461,9 @@ async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cro
 			"UPDATE sm_sync_run SET status=?, completed_at=?, items_processed=?, items_failed=? WHERE id=?",
 		).run("completed", nowIso(), processed, failed, runId)
 		console.log(`[connector] granola sync ${connId} done: ${processed} ingested, ${failed} failed`)
-		if (processed === 0 && failed === 0) {
+		if (processed === 0 && failed === 0 && !createdAfter) {
+			// Only on a full sync (no incremental filter): 0 notes points to a key-scope issue.
+			// On incremental passes, 0 just means "nothing new" — no hint needed.
 			console.log(
 				`[connector] granola sync ${connId}: API returned 0 notes — check the key's scope (Personal/Public notes) and that notes have an AI summary+transcript`,
 			)
