@@ -312,6 +312,18 @@ async function granolaCheckKey(apiKey: string): Promise<"ok" | "invalid" | "unkn
 	}
 }
 
+// The Granola cursor can be a string or an object; extract a usable string token.
+function cursorToken(c: unknown): string | undefined {
+	if (typeof c === "string") return c || undefined
+	if (c && typeof c === "object") {
+		const o = c as Record<string, unknown>
+		for (const k of ["token", "next", "next_cursor", "cursor", "value"]) {
+			if (typeof o[k] === "string" && o[k]) return o[k] as string
+		}
+	}
+	return undefined
+}
+
 // One page of notes. Tolerates envelope variants (notes/data, hasMore/has_more) and backs off on 429.
 async function granolaListNotes(
 	apiKey: string,
@@ -338,7 +350,7 @@ async function granolaListNotes(
 	}
 	return {
 		notes: data.notes ?? data.data ?? [],
-		cursor: data.cursor,
+		cursor: cursorToken(data.cursor),
 		hasMore: Boolean(data.hasMore ?? data.has_more),
 	}
 }
@@ -426,6 +438,11 @@ async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cro
 			"UPDATE sm_sync_run SET status=?, completed_at=?, items_processed=?, items_failed=? WHERE id=?",
 		).run("completed", nowIso(), processed, failed, runId)
 		console.log(`[connector] granola sync ${connId} done: ${processed} ingested, ${failed} failed`)
+		if (processed === 0 && failed === 0) {
+			console.log(
+				`[connector] granola sync ${connId}: API returned 0 notes — check the key's scope (Personal/Public notes) and that notes have an AI summary+transcript`,
+			)
+		}
 	} catch (e) {
 		db.query(
 			"UPDATE sm_sync_run SET status=?, completed_at=?, items_processed=?, items_failed=?, error=? WHERE id=?",
