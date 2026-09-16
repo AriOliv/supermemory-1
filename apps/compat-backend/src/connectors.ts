@@ -303,6 +303,7 @@ type GranolaNote = {
 	summary_text?: string
 	transcript?: unknown
 	created_at?: string
+	updated_at?: string
 }
 
 // Quick key probe: distinguishes a bad key (reject at connect) from a transient error (allow).
@@ -334,11 +335,10 @@ function cursorToken(c: unknown): string | undefined {
 // One page of notes. Tolerates envelope variants (notes/data, hasMore/has_more) and backs off on 429.
 async function granolaListNotes(
 	apiKey: string,
-	opts: { cursor?: string; createdAfter?: string },
+	opts: { cursor?: string },
 ): Promise<{ notes: GranolaNote[]; cursor?: string; hasMore: boolean }> {
 	const p = new URLSearchParams({ limit: "100" })
 	if (opts.cursor) p.set("cursor", opts.cursor)
-	if (opts.createdAfter) p.set("created_after", opts.createdAfter)
 	if (GRANOLA_INCLUDE_TRANSCRIPT) p.set("include", "transcript")
 	const res = await fetch(`${GRANOLA_API}/notes?${p.toString()}`, {
 		headers: { authorization: `Bearer ${apiKey}` },
@@ -392,8 +392,11 @@ function granolaNoteToContent(n: GranolaNote): string {
 	return parts.join("\n\n").trim()
 }
 
-// Pulls the user's Granola notes into the lite store (mirrors runSync). Incremental via the
-// created_after filter (last successful sync time is kept in the connection metadata).
+// Pulls the user's Granola notes into the lite store (mirrors runSync). Incremental by
+// updated_at: a Granola note becomes visible only once its AI summary+transcript are ready,
+// minutes/hours AFTER its created_at — so a created_after watermark that advances to "now" each
+// run permanently skips those late-processed notes. updated_at reflects when the content became
+// available, catching new AND re-processed notes; unchanged notes are skipped (no re-embedding).
 async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cron") {
 	const r = db.query("SELECT * FROM sm_connection WHERE id=?").get(connId) as ConnRow | null
 	if (!r || r.status !== "connected" || !r.access_token) return
@@ -407,23 +410,25 @@ async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cro
 	try {
 		const tags = r.container_tags ? (JSON.parse(r.container_tags) as string[]) : ["sm_org_shared"]
 		const meta = r.metadata ? (JSON.parse(r.metadata) as Record<string, unknown>) : {}
-		const createdAfter = typeof meta.lastSyncedAt === "string" ? meta.lastSyncedAt : undefined
+		// Watermark = the newest updated_at ingested so far ("" on the first run → backfill all).
+		const lastUpdatedAt = typeof meta.lastUpdatedAt === "string" ? meta.lastUpdatedAt : ""
+		let maxUpdated = lastUpdatedAt
 		const startedAt = nowIso()
 		let cursor: string | undefined
 		let logged = false
 		for (let page = 0; page < 50; page++) {
-			// safety cap: 50 pages × 100 notes
-			const { notes, cursor: next, hasMore } = await granolaListNotes(r.access_token, {
-				cursor,
-				createdAfter,
-			})
+			// safety cap: 50 pages × 100 notes. List everything (no created_after) and filter by
+			// updated_at client-side, fetching each note's detail only when it changed.
+			const { notes, cursor: next, hasMore } = await granolaListNotes(r.access_token, { cursor })
 			if (!logged && notes[0]) {
 				console.log(`[connector] granola list item keys: ${Object.keys(notes[0]).join(",")}`)
 				logged = true
 			}
-			for (const meta of notes) {
+			for (const n of notes) {
+				const upd = n.updated_at || n.created_at || ""
+				if (lastUpdatedAt && upd && upd <= lastUpdatedAt) continue // unchanged since last sync
 				try {
-					const d = await granolaGetNote(r.access_token, meta.id)
+					const d = await granolaGetNote(r.access_token, n.id)
 					if (!d) continue
 					const content = granolaNoteToContent(d)
 					if (!content) continue
@@ -432,10 +437,10 @@ async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cro
 						tags,
 						{
 							source: "granola",
-							name: d.title ?? meta.title ?? "Granola note",
+							name: d.title ?? n.title ?? "Granola note",
 							noteId: d.id,
 							owner: d.owner?.email,
-							createdAt: d.created_at ?? meta.created_at,
+							createdAt: d.created_at ?? n.created_at,
 							...(d.web_url ? { url: d.web_url } : {}),
 							...(d.attendees?.length
 								? { attendees: d.attendees.map((a) => a.email || a.name).filter(Boolean) }
@@ -444,9 +449,10 @@ async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cro
 						`granola:${d.id}`,
 					)
 					processed++
+					if (upd > maxUpdated) maxUpdated = upd
 				} catch (e) {
 					failed++
-					console.error(`[connector] granola note ${meta.id} failed:`, e instanceof Error ? e.message : e)
+					console.error(`[connector] granola note ${n.id} failed:`, e instanceof Error ? e.message : e)
 				}
 				await sleep(250) // throttle (well under the 5 req/s Granola limit)
 			}
@@ -454,16 +460,15 @@ async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cro
 			cursor = next
 		}
 		db.query("UPDATE sm_connection SET metadata=? WHERE id=?").run(
-			JSON.stringify({ ...meta, lastSyncedAt: startedAt }),
+			JSON.stringify({ ...meta, lastUpdatedAt: maxUpdated || undefined, lastSyncedAt: startedAt }),
 			connId,
 		)
 		db.query(
 			"UPDATE sm_sync_run SET status=?, completed_at=?, items_processed=?, items_failed=? WHERE id=?",
 		).run("completed", nowIso(), processed, failed, runId)
 		console.log(`[connector] granola sync ${connId} done: ${processed} ingested, ${failed} failed`)
-		if (processed === 0 && failed === 0 && !createdAfter) {
-			// Only on a full sync (no incremental filter): 0 notes points to a key-scope issue.
-			// On incremental passes, 0 just means "nothing new" — no hint needed.
+		if (processed === 0 && failed === 0 && !lastUpdatedAt) {
+			// First-ever sync ingested nothing → likely a key-scope issue or notes without summary.
 			console.log(
 				`[connector] granola sync ${connId}: API returned 0 notes — check the key's scope (Personal/Public notes) and that notes have an AI summary+transcript`,
 			)
