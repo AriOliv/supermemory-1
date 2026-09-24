@@ -108,7 +108,10 @@ export const authOptions = {
 	// magicLink/emailOTP send email via Resend (email.ts); admin enables the admin panel APIs.
 	plugins: [
 		organization(),
-		apiKey(),
+		// enableMetadata: the console's key-creation UI (settings/integrations) always sends
+		// metadata { organizationId, type }; without this the plugin rejects with "Metadata is
+		// disabled." and no API key can be created from the console.
+		apiKey({ enableMetadata: true }),
 		username(),
 		anonymous(),
 		jwt(),
