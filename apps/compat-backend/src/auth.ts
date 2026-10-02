@@ -113,7 +113,10 @@ export const authOptions = {
 		// the plugin rejects with "Metadata is disabled."; and the default max prefix length is
 		// too small for the org-id-embedded prefix ("The prefix length is either too large or too
 		// small."), so raise maximumPrefixLength to fit it.
-		apiKey({ enableMetadata: true, maximumPrefixLength: 64 }),
+		// rateLimit off: the plugin default is 10 requests / 24h PER KEY (stored on each key at
+		// creation), which a memory client (e.g. Hermes recall/capture) exhausts in minutes.
+		// Disabling it globally also covers keys created before this change.
+		apiKey({ enableMetadata: true, maximumPrefixLength: 64, rateLimit: { enabled: false } }),
 		username(),
 		anonymous(),
 		jwt(),
