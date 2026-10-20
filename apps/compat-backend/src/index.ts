@@ -120,9 +120,35 @@ async function liteContainerTags(): Promise<string[]> {
 	}
 }
 
-type Actor = { userId: string; organizationId: string; via: "cookie" | "bearer" }
+type Actor = { userId: string; organizationId: string; via: "cookie" | "bearer" | "apikey" }
 
-// Authenticate a request by console session cookie OR OAuth bearer (from the MCP Worker).
+// Console-issued API key (`sm_<orgId>_...`), sent the way the Supermemory SDKs/clients do:
+// `Authorization: Bearer sm_...` (or `x-api-key`). Validated by the better-auth apiKey plugin;
+// the org comes from the key metadata the console writes ({ organizationId, type }).
+function apiKeyFrom(headers: Headers): string | null {
+	const bearer = headers.get("authorization")?.match(/^Bearer\s+(\S+)$/i)?.[1]
+	if (bearer?.startsWith("sm_")) return bearer
+	const x = headers.get("x-api-key")?.trim()
+	return x?.startsWith("sm_") ? x : null
+}
+
+async function resolveApiKeyActor(key: string): Promise<Actor | null> {
+	try {
+		const res = (await auth.api.verifyApiKey({ body: { key } })) as {
+			valid?: boolean
+			key?: { userId?: string; metadata?: { organizationId?: string } | null } | null
+		}
+		const userId = res?.valid ? res.key?.userId : undefined
+		if (!userId) return null
+		const orgId = res.key?.metadata?.organizationId ?? firstOrgId(userId) ?? userId
+		return { userId, organizationId: orgId, via: "apikey" }
+	} catch {
+		return null
+	}
+}
+
+// Authenticate a request by console session cookie, console API key (sm_...), OR OAuth
+// bearer (from the MCP Worker).
 async function resolveActor(c: { req: { raw: Request } }): Promise<Actor | null> {
 	const s = await getSession(c)
 	if (s?.user) {
@@ -130,6 +156,9 @@ async function resolveActor(c: { req: { raw: Request } }): Promise<Actor | null>
 			s.session?.activeOrganizationId ?? firstOrgId(s.user.id) ?? s.user.id
 		return { userId: s.user.id, organizationId: orgId, via: "cookie" }
 	}
+	// An sm_ key is never an OAuth token — don't fall through to getMcpSession on failure.
+	const key = apiKeyFrom(c.req.raw.headers)
+	if (key) return resolveApiKeyActor(key)
 	try {
 		const mcpSession = (await auth.api.getMcpSession({
 			headers: c.req.raw.headers,
@@ -191,6 +220,10 @@ async function proxyToLite(c: { req: { url: string; method: string; raw: Request
 	}
 
 	const outHeaders = new Headers(resp.headers)
+	// redirect:"manual" passes lite's redirects through; don't leak the internal origin.
+	// Relative Location (RFC 7231) — url.origin may be http:// behind the TLS proxy.
+	const loc = outHeaders.get("location")
+	if (loc?.startsWith(LITE_URL)) outHeaders.set("location", loc.slice(LITE_URL.length) || "/")
 	outHeaders.delete("content-encoding")
 	outHeaders.delete("transfer-encoding")
 	outHeaders.delete("content-length")
