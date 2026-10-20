@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "supermemory-mcp",
+	"name": "avenia-supermemory-mcp",
 	"build": {
 		"command": "bun run build:widget"
 	},
@@ -11,13 +11,15 @@
 	"rules": [{ "type": "Text", "globs": ["**/*.html"], "fallthrough": false }],
 
 	"vars": {
-		"API_URL": "https://api.supermemory.ai"
+		"API_URL": "https://api.os.avenia.tech",
+		"MCP_RESOURCE": "https://mcp.os.avenia.tech/mcp",
+		"MCP_PUBLIC_ORIGIN": "https://mcp.os.avenia.tech"
 	},
 
 	"routes": [
 		{
-			"pattern": "mcp.supermemory.ai",
-			"zone_name": "supermemory.ai",
+			"pattern": "mcp.os.avenia.tech",
+			"zone_name": "avenia.tech",
 			"custom_domain": true
 		}
 	],
