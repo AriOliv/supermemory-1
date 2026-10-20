@@ -603,9 +603,16 @@ slack.post("/events", async (c) => {
 			if (processed.size > 5000) processed.clear()
 		}
 		await ensureDirectInstall()
-		const inst = installForTeam(payload.team_id)
+		// Resolve the team robustly (top-level, then the authorizations list, then the event).
+		const teamId =
+			payload.team_id ?? payload.authorizations?.[0]?.team_id ?? payload.event?.team
+		const inst = teamId ? installForTeam(teamId) : null
+		const ev = payload.event ?? {}
+		console.log(
+			`[slack] event team=${teamId ?? "-"} install=${inst ? "y" : "n"} type=${ev.type ?? "-"} subtype=${ev.subtype ?? "-"} ch=${ev.channel_type ?? "-"} bot=${ev.bot_id ? "y" : "n"} len=${(ev.text ?? "").length}`,
+		)
 		if (inst) {
-			handleEvent(inst, payload.event).catch((e) =>
+			handleEvent(inst, ev).catch((e) =>
 				console.error("[slack] handleEvent error:", e instanceof Error ? e.message : e),
 			)
 		}
