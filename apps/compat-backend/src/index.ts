@@ -147,9 +147,27 @@ async function resolveApiKeyActor(key: string): Promise<Actor | null> {
 	}
 }
 
+// Banned users (admin plugin) are refused on every path, including API keys and MCP OAuth
+// tokens, which better-auth does not check against the ban on its own.
+function isBanned(userId: string): boolean {
+	try {
+		const row = authDb.query("SELECT banned FROM user WHERE id = ?").get(userId) as
+			| { banned?: number | boolean | null }
+			| undefined
+		return Boolean(row?.banned)
+	} catch {
+		return false
+	}
+}
+
 // Authenticate a request by console session cookie, console API key (sm_...), OR OAuth
 // bearer (from the MCP Worker).
 async function resolveActor(c: { req: { raw: Request } }): Promise<Actor | null> {
+	const actor = await resolveActorUnchecked(c)
+	return actor && !isBanned(actor.userId) ? actor : null
+}
+
+async function resolveActorUnchecked(c: { req: { raw: Request } }): Promise<Actor | null> {
 	const s = await getSession(c)
 	if (s?.user) {
 		const orgId =
