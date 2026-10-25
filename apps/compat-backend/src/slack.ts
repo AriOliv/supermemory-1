@@ -63,6 +63,28 @@ const EXTRACTION_MODE = (process.env.SLACK_EXTRACTION_MODE ?? "durable") as
 	| "durable"
 	| "all"
 	| "on-demand"
+const envFlag = (v: string | undefined) => ["1", "true", "yes", "on"].includes((v ?? "").trim().toLowerCase())
+// Slack Connect channels (shared with other companies) are "public" in our workspace but carry
+// third-party content. Kept out of the org brain unless explicitly enabled.
+const INCLUDE_SHARED_CHANNELS = envFlag(process.env.SLACK_INCLUDE_SHARED_CHANNELS)
+// Opt-in: the bot joins every public channel itself (needs the channels:join scope) instead of
+// waiting for /invite. Channel IDs in SLACK_AUTO_JOIN_EXCLUDE are never joined.
+const AUTO_JOIN = envFlag(process.env.SLACK_AUTO_JOIN)
+const AUTO_JOIN_EXCLUDE = new Set(
+	(process.env.SLACK_AUTO_JOIN_EXCLUDE ?? "")
+		.split(",")
+		.map((s) => s.trim())
+		.filter(Boolean),
+)
+// Name globs (only `*` is special) never auto-joined — covers channels created later, which the
+// ID list can't know about. Default: bot/alert/deploy feeds. Set to "" to disable.
+const AUTO_JOIN_EXCLUDE_PATTERNS = (process.env.SLACK_AUTO_JOIN_EXCLUDE_PATTERNS ?? "alerts-*,*-alerts,*-alerts-*,*-alertas,*-deploys")
+	.split(",")
+	.map((s) => s.trim().toLowerCase())
+	.filter(Boolean)
+	.map((g) => new RegExp(`^${g.split("*").map((p) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`))
+const autoJoinExcluded = (info: ChannelInfo) =>
+	AUTO_JOIN_EXCLUDE.has(info.id) || AUTO_JOIN_EXCLUDE_PATTERNS.some((re) => re.test((info.name ?? "").toLowerCase()))
 // The org's shared Company Brain space (the same tag chat/MCP treat as the org brain).
 const ORG_BRAIN_TAG = process.env.SM_BRAIN_CONTAINER_TAG ?? "sm_org_shared"
 
@@ -114,7 +136,53 @@ db.exec(`
     created_at TEXT NOT NULL,
     PRIMARY KEY (team_id, channel_id)
   );
+  -- Durable ingestion queue: one row per Slack message headed for the brain. Survives restarts,
+  -- dedupes Slack retries (PK) and retries failed steps with backoff. text/facts are cleared as
+  -- soon as a row reaches a terminal status; last_error holds metadata only (never content).
+  CREATE TABLE IF NOT EXISTS sm_slack_ingest (
+    id TEXT PRIMARY KEY,
+    team_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    user_id TEXT,
+    kind TEXT NOT NULL,
+    text TEXT,
+    facts TEXT,
+    status TEXT NOT NULL,
+    doc_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_at INTEGER NOT NULL,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS sm_slack_ingest_due ON sm_slack_ingest (status, next_at);
 `)
+// Slack user directory (users.list + user_change/team_join). Canonical identity is the email.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sm_slack_user (
+    team_id TEXT NOT NULL,
+    slack_user_id TEXT NOT NULL,
+    real_name TEXT,
+    display_name TEXT,
+    handle TEXT,
+    email TEXT,
+    title TEXT,
+    is_bot INTEGER NOT NULL DEFAULT 0,
+    is_restricted INTEGER NOT NULL DEFAULT 0,
+    is_ultra_restricted INTEGER NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    tz TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, slack_user_id)
+  );
+  CREATE INDEX IF NOT EXISTS sm_slack_user_email ON sm_slack_user (email);
+`)
+try {
+	db.exec("ALTER TABLE sm_slack_channel ADD COLUMN is_ext_shared INTEGER NOT NULL DEFAULT 0")
+} catch {
+	// column already exists
+}
 
 const nowIso = () => new Date().toISOString()
 
@@ -259,12 +327,16 @@ function verifySlackSignature(raw: string, signature: string | undefined, timest
 }
 
 // ---- Slack Web API ----
+// Sent form-encoded: read methods (conversations.info, users.info, …) reject JSON bodies with
+// invalid_arguments / user_not_found, while every method accepts form params.
 async function slackCall<T = any>(botToken: string, method: string, body: Record<string, unknown>): Promise<T | null> {
 	try {
+		const form = new URLSearchParams()
+		for (const [k, v] of Object.entries(body)) if (v !== undefined && v !== null) form.set(k, String(v))
 		const res = await fetch(`https://slack.com/api/${method}`, {
 			method: "POST",
-			headers: { authorization: `Bearer ${botToken}`, "content-type": "application/json; charset=utf-8" },
-			body: JSON.stringify(body),
+			headers: { authorization: `Bearer ${botToken}`, "content-type": "application/x-www-form-urlencoded" },
+			body: form,
 		})
 		const data = (await res.json()) as { ok?: boolean }
 		if (!data.ok) console.error(`[slack] ${method} not ok:`, (data as any).error)
@@ -274,6 +346,52 @@ async function slackCall<T = any>(botToken: string, method: string, body: Record
 		return null
 	}
 }
+
+type ChannelInfo = { id: string; name?: string; isPublic: boolean; isExtShared: boolean }
+const channelCache = new Map<string, { info: ChannelInfo; at: number }>()
+// Authoritative channel visibility from Slack (cached 10 min) — the gate for what may enter the
+// org-wide space. Returns null when Slack can't be reached, so callers retry instead of guessing.
+async function channelInfo(inst: Install, channel: string): Promise<ChannelInfo | null> {
+	const key = `${inst.team_id}:${channel}`
+	const hit = channelCache.get(key)
+	if (hit && Date.now() - hit.at < 10 * 60_000) return hit.info
+	const r = await slackCall<{
+		ok?: boolean
+		channel?: { name?: string; is_channel?: boolean; is_private?: boolean; is_im?: boolean; is_mpim?: boolean; is_ext_shared?: boolean }
+	}>(inst.bot_token, "conversations.info", { channel })
+	if (!r?.ok || !r.channel) return null
+	const ch = r.channel
+	const info: ChannelInfo = {
+		id: channel,
+		name: ch.name,
+		isPublic: Boolean(ch.is_channel) && !ch.is_private && !ch.is_im && !ch.is_mpim,
+		isExtShared: Boolean(ch.is_ext_shared),
+	}
+	channelCache.set(key, { info, at: Date.now() })
+	upsertChannel(inst.team_id, info, null)
+	return info
+}
+function upsertChannel(teamId: string, info: ChannelInfo, status: string | null) {
+	db.query(
+		`INSERT INTO sm_slack_channel (team_id, channel_id, name, is_private, is_ext_shared, container_tag, status, created_at)
+       VALUES (?,?,?,?,?,?,?,?)
+       ON CONFLICT(team_id, channel_id) DO UPDATE SET name=excluded.name, is_private=excluded.is_private,
+         is_ext_shared=excluded.is_ext_shared, status=COALESCE(?, sm_slack_channel.status)`,
+	).run(
+		teamId,
+		info.id,
+		info.name ?? null,
+		info.isPublic ? 0 : 1,
+		info.isExtShared ? 1 : 0,
+		info.isPublic ? ORG_BRAIN_TAG : null,
+		status ?? "discovered",
+		nowIso(),
+		status,
+	)
+}
+// Only internal public channels feed the org brain (rule: private channels/DMs stay out until
+// per-user scoping exists; Slack Connect channels only when explicitly enabled).
+const brainEligible = (info: ChannelInfo) => info.isPublic && (INCLUDE_SHARED_CHANNELS || !info.isExtShared)
 async function postMessage(inst: Install, channel: string, text: string, threadTs?: string) {
 	await slackCall(inst.bot_token, "chat.postMessage", {
 		channel,
@@ -282,12 +400,6 @@ async function postMessage(inst: Install, channel: string, text: string, threadT
 		unfurl_links: false,
 	})
 }
-async function channelName(inst: Install, channel: string): Promise<string | undefined> {
-	const r = await slackCall<{ channel?: { name?: string } }>(inst.bot_token, "conversations.info", {
-		channel,
-	})
-	return r?.channel?.name
-}
 async function permalink(inst: Install, channel: string, ts: string): Promise<string | undefined> {
 	const r = await slackCall<{ permalink?: string }>(inst.bot_token, "chat.getPermalink", {
 		channel,
@@ -295,21 +407,205 @@ async function permalink(inst: Install, channel: string, ts: string): Promise<st
 	})
 	return r?.permalink
 }
-async function userName(inst: Install, userId: string): Promise<string | undefined> {
-	const r = await slackCall<{ user?: { real_name?: string; name?: string } }>(inst.bot_token, "users.info", {
-		user: userId,
-	})
-	return r?.user?.real_name ?? r?.user?.name
+// ---- user directory (sm_slack_user) ----
+// Filled by users.list (boot + every 6h) and the user_change/team_join events, so ingestion reads
+// identities locally. users.info is only a fallback for an ID the directory doesn't have yet.
+// Logs carry counts only — never names, emails or user IDs.
+type SlackApiUser = {
+	id: string
+	name?: string
+	real_name?: string
+	deleted?: boolean
+	is_bot?: boolean
+	is_restricted?: boolean
+	is_ultra_restricted?: boolean
+	tz?: string
+	profile?: { real_name?: string; display_name?: string; email?: string; title?: string }
+}
+type SlackUser = {
+	team_id: string
+	slack_user_id: string
+	real_name: string | null
+	display_name: string | null
+	handle: string | null
+	email: string | null
+	title: string | null
+	is_bot: number
+	is_restricted: number
+	is_ultra_restricted: number
+	deleted: number
+	tz: string | null
+}
+
+function upsertUser(teamId: string, u: SlackApiUser) {
+	if (!u?.id) return
+	const p = u.profile ?? {}
+	const str = (v: string | undefined) => (v?.trim() ? v.trim() : null)
+	db.query(
+		`INSERT INTO sm_slack_user (team_id, slack_user_id, real_name, display_name, handle, email, title, is_bot,
+       is_restricted, is_ultra_restricted, deleted, tz, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(team_id, slack_user_id) DO UPDATE SET real_name=excluded.real_name,
+       display_name=excluded.display_name, handle=excluded.handle, email=excluded.email, title=excluded.title,
+       is_bot=excluded.is_bot, is_restricted=excluded.is_restricted, is_ultra_restricted=excluded.is_ultra_restricted,
+       deleted=excluded.deleted, tz=excluded.tz, updated_at=excluded.updated_at`,
+	).run(
+		teamId,
+		u.id,
+		str(p.real_name ?? u.real_name),
+		str(p.display_name),
+		str(u.name),
+		str(p.email)?.toLowerCase() ?? null,
+		str(p.title),
+		// is_app_user marks a person who authorized an app, not a bot — only is_bot counts.
+		u.is_bot || u.id === "USLACKBOT" ? 1 : 0,
+		u.is_restricted ? 1 : 0,
+		u.is_ultra_restricted ? 1 : 0,
+		u.deleted ? 1 : 0,
+		str(u.tz),
+		nowIso(),
+	)
+}
+
+async function syncUsers(inst: Install) {
+	let cursor = ""
+	let n = 0
+	do {
+		const r = await slackCall<{ ok?: boolean; members?: SlackApiUser[]; response_metadata?: { next_cursor?: string } }>(
+			inst.bot_token,
+			"users.list",
+			{ limit: 200, ...(cursor ? { cursor } : {}) },
+		)
+		if (!r?.ok) return
+		const tx = db.transaction((members: SlackApiUser[]) => {
+			for (const u of members) upsertUser(inst.team_id, u)
+		})
+		tx(r.members ?? [])
+		n += r.members?.length ?? 0
+		cursor = r.response_metadata?.next_cursor ?? ""
+		if (cursor) await new Promise((res) => setTimeout(res, 3_000)) // users.list is Tier 2 (~20/min)
+	} while (cursor)
+	const c = db
+		.query(
+			`SELECT sum(is_bot=0 AND deleted=0) people, sum(is_bot) bots, sum(deleted) deleted,
+         sum(is_restricted OR is_ultra_restricted) guests, sum(is_bot=0 AND email IS NOT NULL) with_email
+       FROM sm_slack_user WHERE team_id=?`,
+		)
+		.get(inst.team_id) as Record<string, number>
+	console.log(
+		`[slack] user sync team=${inst.team_id} fetched=${n} people=${c.people} bots=${c.bots} guests=${c.guests} deleted=${c.deleted} with_email=${c.with_email}`,
+	)
+}
+
+const userMissAt = new Map<string, number>() // users.info fallback backoff per unknown ID
+async function lookupUsers(inst: Install, ids: string[]): Promise<Map<string, SlackUser>> {
+	const out = new Map<string, SlackUser>()
+	for (const id of new Set(ids)) {
+		let u = db.query("SELECT * FROM sm_slack_user WHERE team_id=? AND slack_user_id=?").get(inst.team_id, id) as
+			| SlackUser
+			| null
+		if (!u && Date.now() - (userMissAt.get(id) ?? 0) > 3_600_000) {
+			const r = await slackCall<{ ok?: boolean; user?: SlackApiUser }>(inst.bot_token, "users.info", { user: id })
+			if (r?.ok && r.user) {
+				upsertUser(inst.team_id, { ...r.user, id })
+				u = db.query("SELECT * FROM sm_slack_user WHERE team_id=? AND slack_user_id=?").get(inst.team_id, id) as SlackUser
+			} else userMissAt.set(id, Date.now())
+		}
+		if (u) out.set(id, u)
+	}
+	return out
+}
+
+const displayName = (u: SlackUser | undefined) => u?.real_name || u?.display_name || u?.handle || undefined
+
+// The console (better-auth) user with the same email, if any — the hook for account-linking.
+function consoleUserIdByEmail(email: string | null | undefined): string | undefined {
+	if (!email) return undefined
+	try {
+		const row = authDb.query("SELECT id FROM user WHERE lower(email)=? LIMIT 1").get(email.toLowerCase()) as
+			| { id?: string }
+			| undefined
+		return row?.id
+	} catch {
+		return undefined
+	}
+}
+
+// Slack mrkdwn → plain text the LLM and search understand: <@U…> → @Nome, <#C…|x> → #x,
+// <!here> → @here, <!subteam^S…|@g> → @g, <url|label> → label (url).
+const USER_MENTION_RE = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g
+const mentionedIds = (text: string) => [...text.matchAll(USER_MENTION_RE)].map((m) => m[1] as string)
+function resolveMrkdwn(teamId: string, text: string, users: Map<string, SlackUser>): string {
+	return text
+		.replace(USER_MENTION_RE, (_, id: string) => {
+			const u = users.get(id)
+			const name = displayName(u)
+			return name ? `@${name}${u?.is_bot ? " (bot)" : ""}` : "@usuário"
+		})
+		.replace(/<#(C[A-Z0-9]+)(?:\|([^>]*))?>/g, (_, id: string, label?: string) => {
+			if (label) return `#${label}`
+			const row = db.query("SELECT name FROM sm_slack_channel WHERE team_id=? AND channel_id=?").get(teamId, id) as
+				| { name?: string }
+				| null
+			return row?.name ? `#${row.name}` : "#canal"
+		})
+		.replace(/<!subteam\^[A-Z0-9]+(?:\|([^>]*))?>/g, (_, label?: string) => label ?? "@grupo")
+		.replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, "@$1")
+		.replace(/<((?:https?|mailto):[^|>]+)\|([^>]+)>/g, "$2 ($1)")
+		.replace(/<((?:https?|mailto):[^>]+)>/g, "$1")
+}
+
+type Identity = { header: string; meta: Record<string, string | boolean> }
+// Who said it, in which channel — prefixed to the ingested content and stored as metadata.
+// Bots/apps are labelled as such and never attributed to a person.
+function identityFor(authorId: string | undefined, author: SlackUser | undefined, channel: ChannelInfo): Identity {
+	const where = channel.name ? ` em #${channel.name}` : ""
+	const meta: Record<string, string | boolean> = {}
+	if (authorId) meta.authorSlackId = authorId
+	if (!author) return { header: `Alguém${where}`, meta }
+	if (author.is_bot) {
+		meta.authorIsBot = true
+		const name = displayName(author)
+		if (name) meta.authorName = name
+		return { header: `Bot ${name ?? "do Slack"}${where}`, meta }
+	}
+	const name = displayName(author)
+	if (name) meta.authorName = name
+	if (author.email) meta.authorEmail = author.email
+	const consoleId = consoleUserIdByEmail(author.email)
+	if (consoleId) meta.authorUserId = consoleId
+	if (author.title) meta.authorTitle = author.title
+	if (author.is_restricted || author.is_ultra_restricted) meta.authorIsGuest = true
+	if (author.deleted) meta.authorDeactivated = true
+	return { header: `${name ?? "Alguém"}${author.title ? ` (${author.title})` : ""}${where}`, meta }
 }
 
 // ---- lite store: ingest + search (mirrors connectors.ts / chat.ts) ----
-async function ingest(content: string, containerTags: string[], meta: Record<string, unknown>, customId: string) {
+// Error text never carries the lite response body (it may echo the document back).
+async function ingest(
+	content: string,
+	containerTags: string[],
+	meta: Record<string, unknown>,
+	customId: string,
+): Promise<string | null> {
 	const res = await fetch(`${LITE_URL}/v3/documents`, {
 		method: "POST",
 		headers: { authorization: `Bearer ${LITE_KEY}`, "content-type": "application/json" },
 		body: JSON.stringify({ content, containerTags, metadata: meta, customId }),
 	})
-	if (!res.ok) throw new Error(`ingest failed: ${res.status} ${await res.text()}`)
+	if (!res.ok) throw new Error(`lite ingest http ${res.status}`)
+	const data = (await res.json().catch(() => ({}))) as { id?: string }
+	return data.id ?? null
+}
+// Lite processing status of an ingested document (queued → … → done | failed).
+async function liteDocStatus(docId: string): Promise<string | null> {
+	const res = await fetch(`${LITE_URL}/v3/documents/${encodeURIComponent(docId)}`, {
+		headers: { authorization: `Bearer ${LITE_KEY}` },
+	})
+	if (res.status === 404) return "missing"
+	if (!res.ok) throw new Error(`lite status http ${res.status}`)
+	const data = (await res.json()) as { status?: string }
+	return data.status ?? null
 }
 
 type Retrieved = { text: string; name?: string; url?: string; similarity: number }
@@ -373,23 +669,20 @@ async function retrieveContext(query: string, tags: string[]): Promise<Retrieved
 }
 
 // ---- LLM: durability judgment + answer ----
+// Throws when the LLM can't give a verdict (no key, gateway error, unparseable reply) so the
+// queue retries it — a failed call must never read as "not durable" and drop the message.
 async function extractDurable(text: string): Promise<{ durable: boolean; facts: string }> {
-	if (!LLM_KEY) return { durable: false, facts: "" }
-	try {
-		const { text: out } = await generateText({
-			model: llm.chat(CHAT_MODEL),
-			system:
-				"You triage team chat for a shared knowledge base. Decide if a message contains durable knowledge worth remembering (decisions, facts, how-tos, owners, links, definitions) vs. transient chatter (greetings, reactions, scheduling noise). If durable, rewrite the key facts as one or two concise standalone sentences (self-contained, no pronouns). Reply ONLY with strict JSON: {\"durable\": boolean, \"facts\": string}.",
-			prompt: text,
-		})
-		const m = out.match(/\{[\s\S]*\}/)
-		if (!m) return { durable: false, facts: "" }
-		const parsed = JSON.parse(m[0]) as { durable?: boolean; facts?: string }
-		return { durable: Boolean(parsed.durable), facts: (parsed.facts ?? "").trim() }
-	} catch (e) {
-		console.error("[slack] extractDurable failed:", e instanceof Error ? e.message : e)
-		return { durable: false, facts: "" }
-	}
+	if (!LLM_KEY) throw new Error("SM_LLM_API_KEY not set")
+	const { text: out } = await generateText({
+		model: llm.chat(CHAT_MODEL),
+		system:
+			"You triage team chat for a shared knowledge base. Each message starts with its author and channel (\"Name (title) em #channel: text\"); @Name are people mentioned. Decide if a message contains durable knowledge worth remembering (decisions, facts, how-tos, owners, links, definitions) vs. transient chatter (greetings, reactions, scheduling noise). If durable, rewrite the key facts as one or two concise standalone sentences (self-contained, no pronouns), keeping attribution: who decided/stated/owns what, using the author's and mentioned people's names exactly as written. Reply ONLY with strict JSON: {\"durable\": boolean, \"facts\": string}.",
+		prompt: text,
+	})
+	const m = out.match(/\{[\s\S]*\}/)
+	if (!m) throw new Error("triage reply had no JSON object")
+	const parsed = JSON.parse(m[0]) as { durable?: boolean; facts?: string }
+	return { durable: Boolean(parsed.durable), facts: (parsed.facts ?? "").trim() }
 }
 async function answer(question: string, memories: Retrieved[]): Promise<string> {
 	if (!LLM_KEY) return "O assistente não está configurado (falta a chave do LLM)."
@@ -421,39 +714,309 @@ function stripMention(text: string, botUserId: string | null): string {
 	return t.replace(/<@[A-Z0-9]+>/g, " ").replace(/\s+/g, " ").trim()
 }
 
-async function saveToBrain(inst: Install, channel: string, ts: string, content: string, authorId?: string) {
-	if (!content.trim()) return
-	const [name, link, author] = await Promise.all([
-		channelName(inst, channel).catch(() => undefined),
-		permalink(inst, channel, ts).catch(() => undefined),
-		authorId ? userName(inst, authorId).catch(() => undefined) : Promise.resolve(undefined),
-	])
-	await ingest(
-		content,
-		[ORG_BRAIN_TAG],
-		{
-			source: "slack",
-			name: name ? `Slack #${name}` : "Slack",
-			channel,
-			channelName: name,
-			author,
-			authorId,
-			url: link,
-			ts,
-		},
-		`slack:${inst.team_id}:${channel}:${ts}`,
+// `content` is already attributed ("Nome (cargo) em #canal: …") and mention-resolved.
+async function saveToBrain(
+	inst: Install,
+	channel: ChannelInfo,
+	ts: string,
+	content: string,
+	identity: Identity,
+	mentions: Map<string, SlackUser>,
+) {
+	const link = await permalink(inst, channel.id, ts).catch(() => undefined)
+	const people = [...mentions.values()].filter((u) => !u.is_bot)
+	const meta: Record<string, unknown> = {
+		source: "slack",
+		name: channel.name ? `Slack #${channel.name}` : "Slack",
+		channel: channel.id,
+		channelName: channel.name,
+		...identity.meta,
+		url: link,
+		ts,
+	}
+	// Lite metadata values are scalars → lists are stored comma-joined.
+	if (mentions.size) meta.mentionedUserIds = [...mentions.keys()].join(",")
+	const emails = people.map((u) => u.email).filter(Boolean)
+	if (emails.length) meta.mentionedEmails = emails.join(",")
+	return ingest(content, [ORG_BRAIN_TAG], meta, `slack:${inst.team_id}:${channel.id}:${ts}`)
+}
+
+// ---- ingestion queue (sm_slack_ingest) ----
+// pending → (triage) → ingested → done, with retries on every failure:
+//   pending   channel gate + durable triage + POST to lite; a failure backs off and retries.
+//   ingested  waits for the lite pipeline; a lite "failed" doc is re-posted (same customId).
+// Terminal: done | not_durable | skipped (not a public internal channel) | dead (out of attempts).
+// Logs carry ids, statuses and error classes only — never message text.
+type IngestRow = {
+	id: string
+	team_id: string
+	channel_id: string
+	ts: string
+	user_id: string | null
+	kind: "passive" | "save"
+	text: string | null
+	facts: string | null
+	status: string
+	doc_id: string | null
+	attempts: number
+}
+const MAX_ATTEMPTS = Number(process.env.SLACK_INGEST_MAX_ATTEMPTS ?? 20)
+const backoffMs = (attempts: number) => Math.min(30_000 * 2 ** Math.max(0, attempts - 1), 3_600_000)
+const LITE_POLL_MS = 60_000
+
+function enqueue(inst: Install, event: any, kind: IngestRow["kind"], text: string): boolean {
+	const id = `${inst.team_id}:${event.channel}:${event.ts}`
+	const t = nowIso()
+	const r = db
+		.query(
+			`INSERT OR IGNORE INTO sm_slack_ingest (id, team_id, channel_id, ts, user_id, kind, text, status, next_at, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?, 'pending', ?, ?, ?)`,
+		)
+		.run(id, inst.team_id, event.channel, event.ts, event.user ?? null, kind, text, Date.now(), t, t)
+	if (r.changes > 0) {
+		console.log(`[slack] ingest queued id=${id} kind=${kind} len=${text.length}`)
+		kickWorker()
+	}
+	return r.changes > 0
+}
+
+function settle(row: IngestRow, status: string, extra: { doc_id?: string | null; error?: string } = {}) {
+	const terminal = ["done", "not_durable", "skipped"].includes(status)
+	db.query(
+		`UPDATE sm_slack_ingest SET status=?, doc_id=COALESCE(?, doc_id), last_error=?, updated_at=?,
+       text=CASE WHEN ? THEN NULL ELSE text END, facts=CASE WHEN ? THEN NULL ELSE facts END
+     WHERE id=?`,
+	).run(status, extra.doc_id ?? null, extra.error ?? null, nowIso(), terminal ? 1 : 0, terminal ? 1 : 0, row.id)
+	console.log(`[slack] ingest ${status} id=${row.id} attempts=${row.attempts}${extra.error ? ` reason=${extra.error}` : ""}`)
+}
+
+function retryLater(row: IngestRow, status: string, err: string) {
+	const attempts = row.attempts + 1
+	if (attempts >= MAX_ATTEMPTS) {
+		// Content kept so an operator can requeue once the cause is fixed (status='pending').
+		db.query("UPDATE sm_slack_ingest SET status='dead', attempts=?, last_error=?, updated_at=? WHERE id=?").run(
+			attempts,
+			err,
+			nowIso(),
+			row.id,
+		)
+		console.error(`[slack] ingest dead id=${row.id} attempts=${attempts} err=${err}`)
+		return
+	}
+	const delay = backoffMs(attempts)
+	db.query("UPDATE sm_slack_ingest SET status=?, attempts=?, next_at=?, last_error=?, updated_at=? WHERE id=?").run(
+		status,
+		attempts,
+		Date.now() + delay,
+		err,
+		nowIso(),
+		row.id,
 	)
-	console.log(`[slack] saved to brain (${ORG_BRAIN_TAG}) from #${name ?? channel}`)
+	console.error(`[slack] ingest retry id=${row.id} step=${status} attempts=${attempts} in=${Math.round(delay / 1000)}s err=${err}`)
+}
+
+// Error class + short message, safe for logs (provider errors never include the prompt; the lite
+// errors are built by ingest()/liteDocStatus() without the response body).
+function errClass(e: unknown): string {
+	if (!(e instanceof Error)) return String(e).slice(0, 120)
+	const status = (e as { statusCode?: number }).statusCode
+	return `${e.name}${status ? `(${status})` : ""}: ${e.message.replace(/\s+/g, " ").slice(0, 160)}`
+}
+
+async function processPending(inst: Install, row: IngestRow) {
+	const channel = await channelInfo(inst, row.channel_id)
+	if (!channel) return retryLater(row, "pending", "conversations.info unavailable")
+	if (!brainEligible(channel)) {
+		return settle(row, "skipped", { error: channel.isPublic ? "slack_connect_channel" : "not_public_channel" })
+	}
+	// Identity: author + mentioned users from the local directory; mentions rewritten to names so
+	// the triage LLM, the stored text and search all see who is who.
+	const raw = row.text ?? ""
+	const ids = mentionedIds(raw)
+	const users = await lookupUsers(inst, row.user_id ? [row.user_id, ...ids] : ids)
+	const author = row.user_id ? users.get(row.user_id) : undefined
+	const identity = identityFor(row.user_id ?? undefined, author, channel)
+	const mentions = new Map(ids.flatMap((id) => (users.has(id) ? [[id, users.get(id) as SlackUser] as const] : [])))
+	const body = resolveMrkdwn(inst.team_id, raw, users).trim()
+	let content = row.facts ?? body
+	if (row.kind === "passive" && EXTRACTION_MODE === "durable" && !row.facts) {
+		let verdict: { durable: boolean; facts: string }
+		try {
+			verdict = await extractDurable(`${identity.header}: ${body}`)
+		} catch (e) {
+			return retryLater(row, "pending", `triage: ${errClass(e)}`)
+		}
+		if (!verdict.durable) return settle(row, "not_durable")
+		content = verdict.facts || body
+		db.query("UPDATE sm_slack_ingest SET facts=? WHERE id=?").run(content, row.id)
+	}
+	if (!content.trim()) return settle(row, "skipped", { error: "empty" })
+	// The header is always prefixed, so attribution survives even if the extracted facts drop it.
+	const attributed = `${identity.header}: ${content}`
+	let docId: string | null
+	try {
+		docId = await saveToBrain(inst, channel, row.ts, attributed, identity, mentions)
+	} catch (e) {
+		return retryLater(row, "pending", `ingest: ${errClass(e)}`)
+	}
+	if (!docId) return settle(row, "done", { error: "lite returned no id; status not tracked" })
+	db.query(
+		"UPDATE sm_slack_ingest SET status='ingested', doc_id=?, next_at=?, last_error=NULL, updated_at=? WHERE id=?",
+	).run(docId, Date.now() + LITE_POLL_MS, nowIso(), row.id)
+	console.log(`[slack] ingest posted id=${row.id} doc=${docId} tag=${ORG_BRAIN_TAG}`)
+}
+
+async function processIngested(row: IngestRow) {
+	let status: string | null
+	try {
+		status = await liteDocStatus(row.doc_id ?? "")
+	} catch (e) {
+		return retryLater(row, "ingested", `lite status: ${errClass(e)}`)
+	}
+	if (status === "done") return settle(row, "done")
+	if (status === "failed" || status === "missing") {
+		// Back to pending: re-posts with the same customId (facts are kept, so no new triage call).
+		return retryLater(row, "pending", `lite doc ${status}`)
+	}
+	db.query("UPDATE sm_slack_ingest SET next_at=?, updated_at=? WHERE id=?").run(
+		Date.now() + LITE_POLL_MS,
+		nowIso(),
+		row.id,
+	)
+}
+
+let draining = false
+let drainAgain = false
+async function drainQueue() {
+	if (draining) {
+		drainAgain = true
+		return
+	}
+	draining = true
+	try {
+		do {
+			drainAgain = false
+			const rows = db
+				.query(
+					"SELECT * FROM sm_slack_ingest WHERE status IN ('pending','ingested') AND next_at<=? ORDER BY next_at LIMIT 20",
+				)
+				.all(Date.now()) as IngestRow[]
+			for (const row of rows) {
+				const inst = installForTeam(row.team_id)
+				if (!inst) {
+					retryLater(row, row.status, "no install for team")
+					continue
+				}
+				try {
+					if (row.status === "pending") await processPending(inst, row)
+					else await processIngested(row)
+				} catch (e) {
+					retryLater(row, row.status, `unexpected: ${errClass(e)}`)
+				}
+			}
+			if (rows.length === 20) drainAgain = true
+		} while (drainAgain)
+	} finally {
+		draining = false
+	}
+}
+function kickWorker() {
+	drainQueue().catch((e) => console.error("[slack] ingest worker error:", errClass(e)))
+}
+
+// ---- channel sync + optional auto-join (SLACK_AUTO_JOIN) ----
+async function syncChannels(inst: Install) {
+	let cursor = ""
+	let total = 0
+	let member = 0
+	let joined = 0
+	const toJoin: ChannelInfo[] = []
+	do {
+		const r = await slackCall<{
+			ok?: boolean
+			channels?: Array<{ id: string; name?: string; is_member?: boolean; is_ext_shared?: boolean }>
+			response_metadata?: { next_cursor?: string }
+		}>(inst.bot_token, "conversations.list", {
+			types: "public_channel",
+			exclude_archived: true,
+			limit: 1000,
+			...(cursor ? { cursor } : {}),
+		})
+		if (!r?.ok) return
+		for (const ch of r.channels ?? []) {
+			total++
+			const info: ChannelInfo = { id: ch.id, name: ch.name, isPublic: true, isExtShared: Boolean(ch.is_ext_shared) }
+			upsertChannel(inst.team_id, info, ch.is_member ? "member" : null)
+			if (ch.is_member) member++
+			else if (AUTO_JOIN && brainEligible(info) && !autoJoinExcluded(info)) toJoin.push(info)
+		}
+		cursor = r.response_metadata?.next_cursor ?? ""
+	} while (cursor)
+	for (const info of toJoin) {
+		if (await joinChannel(inst, info)) joined++
+		else if (joinBlocked) break
+		await new Promise((r) => setTimeout(r, 1_500)) // conversations.join is Tier 3 (~50/min)
+	}
+	console.log(
+		`[slack] channel sync team=${inst.team_id} public=${total} member=${member + joined} joined_now=${joined} auto_join=${AUTO_JOIN ? "on" : "off"}`,
+	)
+}
+let joinBlocked = false // missing channels:join scope → stop trying until restart
+async function joinChannel(inst: Install, info: ChannelInfo): Promise<boolean> {
+	if (joinBlocked) return false
+	const r = await slackCall<{ ok?: boolean; error?: string }>(inst.bot_token, "conversations.join", { channel: info.id })
+	if (r?.ok) {
+		upsertChannel(inst.team_id, info, "member")
+		return true
+	}
+	if (r?.error === "missing_scope") {
+		joinBlocked = true
+		console.error("[slack] auto-join disabled: the app lacks the channels:join scope (reinstall needed)")
+	}
+	return false
+}
+
+let workerStarted = false
+// Background loops: drain the ingest queue every 15s and re-sync users + channels every 6h.
+export function startSlackWorker() {
+	if (workerStarted) return
+	workerStarted = true
+	setInterval(kickWorker, 15_000)
+	const sync = async () => {
+		await ensureDirectInstall()
+		for (const inst of db.query("SELECT * FROM sm_slack_install").all() as Install[]) {
+			await syncUsers(inst).catch((e) => console.error("[slack] user sync failed:", errClass(e)))
+			await syncChannels(inst).catch((e) => console.error("[slack] channel sync failed:", errClass(e)))
+		}
+	}
+	setTimeout(() => sync().catch(() => {}), 30_000)
+	setInterval(() => sync().catch(() => {}), 6 * 3_600_000)
+	kickWorker()
 }
 
 async function handleMention(inst: Install, event: any) {
 	const text = stripMention(event.text ?? "", inst.bot_user_id)
-	// Explicit save trigger (works in every extraction mode).
+	// Explicit save trigger (works in every extraction mode) — same public-channel gate.
 	if (SAVE_RE.test(text)) {
-		const toSave = text.replace(SAVE_RE, "").trim()
+		// Keep other people's <@U…> mentions in the saved text so the worker resolves them to names.
+		const withMentions = (event.text ?? "")
+			.replace(new RegExp(`<@${inst.bot_user_id ?? "NONE"}>`, "g"), " ")
+			.replace(/\s+/g, " ")
+			.trim()
+		const toSave = withMentions.replace(SAVE_RE, "").trim()
 		if (toSave) {
-			await saveToBrain(inst, event.channel, event.ts, toSave, event.user)
-			await postMessage(inst, event.channel, "✅ Guardei isso na memória da empresa.", event.thread_ts ?? event.ts)
+			const channel = await channelInfo(inst, event.channel)
+			if (channel && !brainEligible(channel)) {
+				await postMessage(
+					inst,
+					event.channel,
+					"Por enquanto só guardo na memória da empresa o que vem de canais públicos internos.",
+					event.thread_ts ?? event.ts,
+				)
+				return
+			}
+			enqueue(inst, event, "save", toSave)
+			await postMessage(inst, event.channel, "✅ Anotado, vai para a memória da empresa.", event.thread_ts ?? event.ts)
 		} else {
 			await postMessage(
 				inst,
@@ -465,8 +1028,12 @@ async function handleMention(inst: Install, event: any) {
 		return
 	}
 	if (!text) return
-	const memories = await retrieveContext(text, [ORG_BRAIN_TAG])
-	const reply = await answer(text, memories)
+	// Question: resolve the other mentions to names so "o que o @Fulano decidiu?" keeps the person.
+	const raw = (event.text ?? "").replace(new RegExp(`<@${inst.bot_user_id ?? "NONE"}>`, "g"), " ")
+	const users = await lookupUsers(inst, mentionedIds(raw))
+	const question = resolveMrkdwn(inst.team_id, raw, users).replace(/\s+/g, " ").trim() || text
+	const memories = await retrieveContext(question, [ORG_BRAIN_TAG])
+	const reply = await answer(question, memories)
 	await postMessage(inst, event.channel, reply, event.thread_ts ?? event.ts)
 }
 
@@ -475,13 +1042,8 @@ async function handlePublicMessage(inst: Install, event: any) {
 	const text = (event.text ?? "").trim()
 	if (text.length < 12) return
 	if (inst.bot_user_id && text.includes(`<@${inst.bot_user_id}>`)) return // mention → handled by app_mention
-	let toIngest = text
-	if (EXTRACTION_MODE === "durable") {
-		const v = await extractDurable(text)
-		if (!v.durable) return
-		toIngest = v.facts || text
-	}
-	await saveToBrain(inst, event.channel, event.ts, toIngest, event.user)
+	// Triage + ingest run in the queue worker (retried on failure, gated on channel visibility).
+	enqueue(inst, event, "passive", text)
 }
 
 async function handleEvent(inst: Install, event: any) {
@@ -489,6 +1051,18 @@ async function handleEvent(inst: Install, event: any) {
 	if (!event || event.bot_id) return
 	if (inst.bot_user_id && event.user === inst.bot_user_id) return
 	if (event.type === "app_mention") return handleMention(inst, event)
+	// Directory upkeep: profile edits, deactivations and new members (no users.list round-trip).
+	if ((event.type === "user_change" || event.type === "team_join") && event.user?.id) {
+		upsertUser(inst.team_id, event.user as SlackApiUser)
+		console.log(`[slack] user directory ${event.type} applied`)
+		return
+	}
+	// New public channel → join it right away when auto-join is on (needs the channel_created event).
+	if (event.type === "channel_created" && AUTO_JOIN && event.channel?.id) {
+		const info = await channelInfo(inst, event.channel.id)
+		if (info && brainEligible(info) && !autoJoinExcluded(info)) await joinChannel(inst, info)
+		return
+	}
 	if (event.type === "message") {
 		if (event.subtype) return // edited/deleted/system messages
 		if (event.channel_type === "channel") return handlePublicMessage(inst, event)
@@ -508,7 +1082,22 @@ slack.get("/status", async (c) => {
 	if (!sess) return json({ error: "Unauthorized" }, 401)
 	await ensureDirectInstall()
 	const inst = installForOrg(sess.orgId)
-	return json({ connected: Boolean(inst), teamName: inst?.team_name ?? null })
+	// Ingestion health (counts only): queue by status + channels the bot is in.
+	const queue = inst
+		? Object.fromEntries(
+				(
+					db
+						.query("SELECT status, count(*) n FROM sm_slack_ingest WHERE team_id=? GROUP BY status")
+						.all(inst.team_id) as Array<{ status: string; n: number }>
+				).map((r) => [r.status, r.n]),
+			)
+		: {}
+	const channels = inst
+		? (db
+				.query("SELECT count(*) n FROM sm_slack_channel WHERE team_id=? AND status='member' AND is_private=0")
+				.get(inst.team_id) as { n: number }).n
+		: 0
+	return json({ connected: Boolean(inst), teamName: inst?.team_name ?? null, ingest: { queue, publicChannelsJoined: channels } })
 })
 
 // GET /brain/slack/oauth/install — 302 to Slack's authorize screen (browser nav w/ session cookie).

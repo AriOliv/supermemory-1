@@ -4,7 +4,7 @@ import { cors } from "hono/cors"
 import { auth, authDb } from "./auth"
 import { chat } from "./chat"
 import { connectors, startResyncScheduler } from "./connectors"
-import { ensureDirectInstall, slack, slackStatusForOrg } from "./slack"
+import { ensureDirectInstall, slack, slackStatusForOrg, startSlackWorker } from "./slack"
 
 /**
  * Compatibility backend for the Supermemory OSS console.
@@ -342,4 +342,6 @@ app.all("/brain/*", () => json({}))
 console.log(`[compat] :${PORT}  lite=${LITE_URL}  origins=${ORIGINS.join(",")}`)
 // Periodic auto re-sync of knowledge-base connectors (Drive + Granola).
 startResyncScheduler()
+// Slack ingestion queue worker + periodic public-channel sync (and auto-join when enabled).
+startSlackWorker()
 export default { port: PORT, fetch: app.fetch }
