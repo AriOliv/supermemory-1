@@ -34,6 +34,9 @@ const GRANOLA_INCLUDE_TRANSCRIPT = process.env.SM_GRANOLA_INCLUDE_TRANSCRIPT ===
 
 // Periodic auto re-sync of every connected connection (Drive + Granola). 0 disables it.
 const RESYNC_INTERVAL_HOURS = Number(process.env.SM_RESYNC_INTERVAL_HOURS ?? 4)
+// Granola notes are personal meeting notes: they default to a per-user tag, never to the shared
+// org tag the Slack brain reads (sm_org_shared).
+const granolaDefaultTags = (userId: string) => [`sm_user_${userId}`]
 
 const db = new Database(DB_PATH)
 db.exec(`
@@ -408,7 +411,7 @@ async function runGranolaSync(connId: string, trigger: "manual" | "event" | "cro
 	let processed = 0
 	let failed = 0
 	try {
-		const tags = r.container_tags ? (JSON.parse(r.container_tags) as string[]) : ["sm_org_shared"]
+		const tags = r.container_tags ? (JSON.parse(r.container_tags) as string[]) : granolaDefaultTags(r.user_id)
 		const meta = r.metadata ? (JSON.parse(r.metadata) as Record<string, unknown>) : {}
 		// Watermark = the newest updated_at ingested so far ("" on the first run → backfill all).
 		const lastUpdatedAt = typeof meta.lastUpdatedAt === "string" ? meta.lastUpdatedAt : ""
@@ -608,7 +611,7 @@ connectors.post("/:provider", async (c) => {
 		const apiKey = body.metadata?.apiKey?.trim()
 		if (!apiKey) return jsonError("missing Granola API key (metadata.apiKey)", 400)
 		if ((await granolaCheckKey(apiKey)) === "invalid") return jsonError("invalid Granola API key", 400)
-		const tags = body.containerTags?.length ? body.containerTags : ["sm_org_shared"]
+		const tags = body.containerTags?.length ? body.containerTags : granolaDefaultTags(userId)
 		// Never persist the key in metadata — toConnectionResponse returns metadata to the client.
 		const meta: Record<string, unknown> = { ...(body.metadata ?? {}) }
 		delete meta.apiKey

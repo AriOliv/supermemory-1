@@ -11,6 +11,7 @@ import {
 	organization,
 	username,
 } from "better-auth/plugins"
+import { APIError } from "better-auth/api"
 import { sso } from "better-auth/plugins/sso"
 import { actionEmail, sendEmail } from "./email"
 
@@ -56,6 +57,13 @@ const socialProviders =
 // Unset in local dev, so the default localhost-friendly cookie is kept there.
 const COOKIE_DOMAIN = process.env.SM_COMPAT_COOKIE_DOMAIN ?? ""
 
+// Only these e-mail domains may create an account, whatever the method (password, magic link,
+// OTP, Google, anonymous). Anonymous users get a placeholder e-mail, so they are refused too.
+const ALLOWED_EMAIL_DOMAINS = (process.env.SM_COMPAT_ALLOWED_EMAIL_DOMAINS ?? "avenia.io")
+	.split(",")
+	.map((s) => s.trim().toLowerCase())
+	.filter(Boolean)
+
 // Exported so the proxy can resolve a bearer user's organization directly from the
 // better-auth tables (getMcpSession returns only userId; org isn't in the opaque token).
 export const authDb = new Database(DB_PATH)
@@ -65,6 +73,18 @@ export const authOptions = {
 	baseURL: BASE_URL,
 	secret: SECRET,
 	trustedOrigins: TRUSTED_ORIGINS,
+	databaseHooks: {
+		user: {
+			create: {
+				before: async (user) => {
+					const domain = user.email?.split("@").pop()?.toLowerCase() ?? ""
+					if (!ALLOWED_EMAIL_DOMAINS.includes(domain)) {
+						throw new APIError("FORBIDDEN", { message: "Sign-up is restricted to company accounts" })
+					}
+				},
+			},
+		},
+	},
 	emailAndPassword: {
 		enabled: true,
 		requireEmailVerification: false,
