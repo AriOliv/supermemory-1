@@ -158,6 +158,26 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS sm_slack_ingest_due ON sm_slack_ingest (status, next_at);
 `)
+// Slack user directory (users.list + user_change/team_join). Canonical identity is the email.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sm_slack_user (
+    team_id TEXT NOT NULL,
+    slack_user_id TEXT NOT NULL,
+    real_name TEXT,
+    display_name TEXT,
+    handle TEXT,
+    email TEXT,
+    title TEXT,
+    is_bot INTEGER NOT NULL DEFAULT 0,
+    is_restricted INTEGER NOT NULL DEFAULT 0,
+    is_ultra_restricted INTEGER NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    tz TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, slack_user_id)
+  );
+  CREATE INDEX IF NOT EXISTS sm_slack_user_email ON sm_slack_user (email);
+`)
 try {
 	db.exec("ALTER TABLE sm_slack_channel ADD COLUMN is_ext_shared INTEGER NOT NULL DEFAULT 0")
 } catch {
@@ -387,11 +407,177 @@ async function permalink(inst: Install, channel: string, ts: string): Promise<st
 	})
 	return r?.permalink
 }
-async function userName(inst: Install, userId: string): Promise<string | undefined> {
-	const r = await slackCall<{ user?: { real_name?: string; name?: string } }>(inst.bot_token, "users.info", {
-		user: userId,
-	})
-	return r?.user?.real_name ?? r?.user?.name
+// ---- user directory (sm_slack_user) ----
+// Filled by users.list (boot + every 6h) and the user_change/team_join events, so ingestion reads
+// identities locally. users.info is only a fallback for an ID the directory doesn't have yet.
+// Logs carry counts only — never names, emails or user IDs.
+type SlackApiUser = {
+	id: string
+	name?: string
+	real_name?: string
+	deleted?: boolean
+	is_bot?: boolean
+	is_app_user?: boolean
+	is_restricted?: boolean
+	is_ultra_restricted?: boolean
+	tz?: string
+	profile?: { real_name?: string; display_name?: string; email?: string; title?: string }
+}
+type SlackUser = {
+	team_id: string
+	slack_user_id: string
+	real_name: string | null
+	display_name: string | null
+	handle: string | null
+	email: string | null
+	title: string | null
+	is_bot: number
+	is_restricted: number
+	is_ultra_restricted: number
+	deleted: number
+	tz: string | null
+}
+
+function upsertUser(teamId: string, u: SlackApiUser) {
+	if (!u?.id) return
+	const p = u.profile ?? {}
+	const str = (v: string | undefined) => (v?.trim() ? v.trim() : null)
+	db.query(
+		`INSERT INTO sm_slack_user (team_id, slack_user_id, real_name, display_name, handle, email, title, is_bot,
+       is_restricted, is_ultra_restricted, deleted, tz, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(team_id, slack_user_id) DO UPDATE SET real_name=excluded.real_name,
+       display_name=excluded.display_name, handle=excluded.handle, email=excluded.email, title=excluded.title,
+       is_bot=excluded.is_bot, is_restricted=excluded.is_restricted, is_ultra_restricted=excluded.is_ultra_restricted,
+       deleted=excluded.deleted, tz=excluded.tz, updated_at=excluded.updated_at`,
+	).run(
+		teamId,
+		u.id,
+		str(p.real_name ?? u.real_name),
+		str(p.display_name),
+		str(u.name),
+		str(p.email)?.toLowerCase() ?? null,
+		str(p.title),
+		u.is_bot || u.is_app_user || u.id === "USLACKBOT" ? 1 : 0,
+		u.is_restricted ? 1 : 0,
+		u.is_ultra_restricted ? 1 : 0,
+		u.deleted ? 1 : 0,
+		str(u.tz),
+		nowIso(),
+	)
+}
+
+async function syncUsers(inst: Install) {
+	let cursor = ""
+	let n = 0
+	do {
+		const r = await slackCall<{ ok?: boolean; members?: SlackApiUser[]; response_metadata?: { next_cursor?: string } }>(
+			inst.bot_token,
+			"users.list",
+			{ limit: 200, ...(cursor ? { cursor } : {}) },
+		)
+		if (!r?.ok) return
+		const tx = db.transaction((members: SlackApiUser[]) => {
+			for (const u of members) upsertUser(inst.team_id, u)
+		})
+		tx(r.members ?? [])
+		n += r.members?.length ?? 0
+		cursor = r.response_metadata?.next_cursor ?? ""
+		if (cursor) await new Promise((res) => setTimeout(res, 3_000)) // users.list is Tier 2 (~20/min)
+	} while (cursor)
+	const c = db
+		.query(
+			`SELECT sum(is_bot=0 AND deleted=0) people, sum(is_bot) bots, sum(deleted) deleted,
+         sum(is_restricted OR is_ultra_restricted) guests, sum(is_bot=0 AND email IS NOT NULL) with_email
+       FROM sm_slack_user WHERE team_id=?`,
+		)
+		.get(inst.team_id) as Record<string, number>
+	console.log(
+		`[slack] user sync team=${inst.team_id} fetched=${n} people=${c.people} bots=${c.bots} guests=${c.guests} deleted=${c.deleted} with_email=${c.with_email}`,
+	)
+}
+
+const userMissAt = new Map<string, number>() // users.info fallback backoff per unknown ID
+async function lookupUsers(inst: Install, ids: string[]): Promise<Map<string, SlackUser>> {
+	const out = new Map<string, SlackUser>()
+	for (const id of new Set(ids)) {
+		let u = db.query("SELECT * FROM sm_slack_user WHERE team_id=? AND slack_user_id=?").get(inst.team_id, id) as
+			| SlackUser
+			| null
+		if (!u && Date.now() - (userMissAt.get(id) ?? 0) > 3_600_000) {
+			const r = await slackCall<{ ok?: boolean; user?: SlackApiUser }>(inst.bot_token, "users.info", { user: id })
+			if (r?.ok && r.user) {
+				upsertUser(inst.team_id, { ...r.user, id })
+				u = db.query("SELECT * FROM sm_slack_user WHERE team_id=? AND slack_user_id=?").get(inst.team_id, id) as SlackUser
+			} else userMissAt.set(id, Date.now())
+		}
+		if (u) out.set(id, u)
+	}
+	return out
+}
+
+const displayName = (u: SlackUser | undefined) => u?.real_name || u?.display_name || u?.handle || undefined
+
+// The console (better-auth) user with the same email, if any — the hook for account-linking.
+function consoleUserIdByEmail(email: string | null | undefined): string | undefined {
+	if (!email) return undefined
+	try {
+		const row = authDb.query("SELECT id FROM user WHERE lower(email)=? LIMIT 1").get(email.toLowerCase()) as
+			| { id?: string }
+			| undefined
+		return row?.id
+	} catch {
+		return undefined
+	}
+}
+
+// Slack mrkdwn → plain text the LLM and search understand: <@U…> → @Nome, <#C…|x> → #x,
+// <!here> → @here, <!subteam^S…|@g> → @g, <url|label> → label (url).
+const USER_MENTION_RE = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g
+const mentionedIds = (text: string) => [...text.matchAll(USER_MENTION_RE)].map((m) => m[1] as string)
+function resolveMrkdwn(teamId: string, text: string, users: Map<string, SlackUser>): string {
+	return text
+		.replace(USER_MENTION_RE, (_, id: string) => {
+			const u = users.get(id)
+			const name = displayName(u)
+			return name ? `@${name}${u?.is_bot ? " (bot)" : ""}` : "@usuário"
+		})
+		.replace(/<#(C[A-Z0-9]+)(?:\|([^>]*))?>/g, (_, id: string, label?: string) => {
+			if (label) return `#${label}`
+			const row = db.query("SELECT name FROM sm_slack_channel WHERE team_id=? AND channel_id=?").get(teamId, id) as
+				| { name?: string }
+				| null
+			return row?.name ? `#${row.name}` : "#canal"
+		})
+		.replace(/<!subteam\^[A-Z0-9]+(?:\|([^>]*))?>/g, (_, label?: string) => label ?? "@grupo")
+		.replace(/<!(here|channel|everyone)(?:\|[^>]*)?>/g, "@$1")
+		.replace(/<((?:https?|mailto):[^|>]+)\|([^>]+)>/g, "$2 ($1)")
+		.replace(/<((?:https?|mailto):[^>]+)>/g, "$1")
+}
+
+type Identity = { header: string; meta: Record<string, string | boolean> }
+// Who said it, in which channel — prefixed to the ingested content and stored as metadata.
+// Bots/apps are labelled as such and never attributed to a person.
+function identityFor(authorId: string | undefined, author: SlackUser | undefined, channel: ChannelInfo): Identity {
+	const where = channel.name ? ` em #${channel.name}` : ""
+	const meta: Record<string, string | boolean> = {}
+	if (authorId) meta.authorSlackId = authorId
+	if (!author) return { header: `Alguém${where}`, meta }
+	if (author.is_bot) {
+		meta.authorIsBot = true
+		const name = displayName(author)
+		if (name) meta.authorName = name
+		return { header: `Bot ${name ?? "do Slack"}${where}`, meta }
+	}
+	const name = displayName(author)
+	if (name) meta.authorName = name
+	if (author.email) meta.authorEmail = author.email
+	const consoleId = consoleUserIdByEmail(author.email)
+	if (consoleId) meta.authorUserId = consoleId
+	if (author.title) meta.authorTitle = author.title
+	if (author.is_restricted || author.is_ultra_restricted) meta.authorIsGuest = true
+	if (author.deleted) meta.authorDeactivated = true
+	return { header: `${name ?? "Alguém"}${author.title ? ` (${author.title})` : ""}${where}`, meta }
 }
 
 // ---- lite store: ingest + search (mirrors connectors.ts / chat.ts) ----
@@ -490,7 +676,7 @@ async function extractDurable(text: string): Promise<{ durable: boolean; facts: 
 	const { text: out } = await generateText({
 		model: llm.chat(CHAT_MODEL),
 		system:
-			"You triage team chat for a shared knowledge base. Decide if a message contains durable knowledge worth remembering (decisions, facts, how-tos, owners, links, definitions) vs. transient chatter (greetings, reactions, scheduling noise). If durable, rewrite the key facts as one or two concise standalone sentences (self-contained, no pronouns). Reply ONLY with strict JSON: {\"durable\": boolean, \"facts\": string}.",
+			"You triage team chat for a shared knowledge base. Each message starts with its author and channel (\"Name (title) em #channel: text\"); @Name are people mentioned. Decide if a message contains durable knowledge worth remembering (decisions, facts, how-tos, owners, links, definitions) vs. transient chatter (greetings, reactions, scheduling noise). If durable, rewrite the key facts as one or two concise standalone sentences (self-contained, no pronouns), keeping attribution: who decided/stated/owns what, using the author's and mentioned people's names exactly as written. Reply ONLY with strict JSON: {\"durable\": boolean, \"facts\": string}.",
 		prompt: text,
 	})
 	const m = out.match(/\{[\s\S]*\}/)
@@ -528,26 +714,31 @@ function stripMention(text: string, botUserId: string | null): string {
 	return t.replace(/<@[A-Z0-9]+>/g, " ").replace(/\s+/g, " ").trim()
 }
 
-async function saveToBrain(inst: Install, channel: ChannelInfo, ts: string, content: string, authorId?: string) {
-	const [link, author] = await Promise.all([
-		permalink(inst, channel.id, ts).catch(() => undefined),
-		authorId ? userName(inst, authorId).catch(() => undefined) : Promise.resolve(undefined),
-	])
-	return ingest(
-		content,
-		[ORG_BRAIN_TAG],
-		{
-			source: "slack",
-			name: channel.name ? `Slack #${channel.name}` : "Slack",
-			channel: channel.id,
-			channelName: channel.name,
-			author,
-			authorId,
-			url: link,
-			ts,
-		},
-		`slack:${inst.team_id}:${channel.id}:${ts}`,
-	)
+// `content` is already attributed ("Nome (cargo) em #canal: …") and mention-resolved.
+async function saveToBrain(
+	inst: Install,
+	channel: ChannelInfo,
+	ts: string,
+	content: string,
+	identity: Identity,
+	mentions: Map<string, SlackUser>,
+) {
+	const link = await permalink(inst, channel.id, ts).catch(() => undefined)
+	const people = [...mentions.values()].filter((u) => !u.is_bot)
+	const meta: Record<string, unknown> = {
+		source: "slack",
+		name: channel.name ? `Slack #${channel.name}` : "Slack",
+		channel: channel.id,
+		channelName: channel.name,
+		...identity.meta,
+		url: link,
+		ts,
+	}
+	// Lite metadata values are scalars → lists are stored comma-joined.
+	if (mentions.size) meta.mentionedUserIds = [...mentions.keys()].join(",")
+	const emails = people.map((u) => u.email).filter(Boolean)
+	if (emails.length) meta.mentionedEmails = emails.join(",")
+	return ingest(content, [ORG_BRAIN_TAG], meta, `slack:${inst.team_id}:${channel.id}:${ts}`)
 }
 
 // ---- ingestion queue (sm_slack_ingest) ----
@@ -638,22 +829,33 @@ async function processPending(inst: Install, row: IngestRow) {
 	if (!brainEligible(channel)) {
 		return settle(row, "skipped", { error: channel.isPublic ? "slack_connect_channel" : "not_public_channel" })
 	}
-	let content = row.facts ?? row.text ?? ""
+	// Identity: author + mentioned users from the local directory; mentions rewritten to names so
+	// the triage LLM, the stored text and search all see who is who.
+	const raw = row.text ?? ""
+	const ids = mentionedIds(raw)
+	const users = await lookupUsers(inst, row.user_id ? [row.user_id, ...ids] : ids)
+	const author = row.user_id ? users.get(row.user_id) : undefined
+	const identity = identityFor(row.user_id ?? undefined, author, channel)
+	const mentions = new Map(ids.flatMap((id) => (users.has(id) ? [[id, users.get(id) as SlackUser] as const] : [])))
+	const body = resolveMrkdwn(inst.team_id, raw, users).trim()
+	let content = row.facts ?? body
 	if (row.kind === "passive" && EXTRACTION_MODE === "durable" && !row.facts) {
 		let verdict: { durable: boolean; facts: string }
 		try {
-			verdict = await extractDurable(row.text ?? "")
+			verdict = await extractDurable(`${identity.header}: ${body}`)
 		} catch (e) {
 			return retryLater(row, "pending", `triage: ${errClass(e)}`)
 		}
 		if (!verdict.durable) return settle(row, "not_durable")
-		content = verdict.facts || row.text || ""
+		content = verdict.facts || body
 		db.query("UPDATE sm_slack_ingest SET facts=? WHERE id=?").run(content, row.id)
 	}
 	if (!content.trim()) return settle(row, "skipped", { error: "empty" })
+	// The header is always prefixed, so attribution survives even if the extracted facts drop it.
+	const attributed = `${identity.header}: ${content}`
 	let docId: string | null
 	try {
-		docId = await saveToBrain(inst, channel, row.ts, content, row.user_id ?? undefined)
+		docId = await saveToBrain(inst, channel, row.ts, attributed, identity, mentions)
 	} catch (e) {
 		return retryLater(row, "pending", `ingest: ${errClass(e)}`)
 	}
@@ -775,7 +977,7 @@ async function joinChannel(inst: Install, info: ChannelInfo): Promise<boolean> {
 }
 
 let workerStarted = false
-// Background loops: drain the ingest queue every 15s and re-sync the channel list every 6h.
+// Background loops: drain the ingest queue every 15s and re-sync users + channels every 6h.
 export function startSlackWorker() {
 	if (workerStarted) return
 	workerStarted = true
@@ -783,6 +985,7 @@ export function startSlackWorker() {
 	const sync = async () => {
 		await ensureDirectInstall()
 		for (const inst of db.query("SELECT * FROM sm_slack_install").all() as Install[]) {
+			await syncUsers(inst).catch((e) => console.error("[slack] user sync failed:", errClass(e)))
 			await syncChannels(inst).catch((e) => console.error("[slack] channel sync failed:", errClass(e)))
 		}
 	}
@@ -795,7 +998,12 @@ async function handleMention(inst: Install, event: any) {
 	const text = stripMention(event.text ?? "", inst.bot_user_id)
 	// Explicit save trigger (works in every extraction mode) — same public-channel gate.
 	if (SAVE_RE.test(text)) {
-		const toSave = text.replace(SAVE_RE, "").trim()
+		// Keep other people's <@U…> mentions in the saved text so the worker resolves them to names.
+		const withMentions = (event.text ?? "")
+			.replace(new RegExp(`<@${inst.bot_user_id ?? "NONE"}>`, "g"), " ")
+			.replace(/\s+/g, " ")
+			.trim()
+		const toSave = withMentions.replace(SAVE_RE, "").trim()
 		if (toSave) {
 			const channel = await channelInfo(inst, event.channel)
 			if (channel && !brainEligible(channel)) {
@@ -839,6 +1047,12 @@ async function handleEvent(inst: Install, event: any) {
 	if (!event || event.bot_id) return
 	if (inst.bot_user_id && event.user === inst.bot_user_id) return
 	if (event.type === "app_mention") return handleMention(inst, event)
+	// Directory upkeep: profile edits, deactivations and new members (no users.list round-trip).
+	if ((event.type === "user_change" || event.type === "team_join") && event.user?.id) {
+		upsertUser(inst.team_id, event.user as SlackApiUser)
+		console.log(`[slack] user directory ${event.type} applied`)
+		return
+	}
 	// New public channel → join it right away when auto-join is on (needs the channel_created event).
 	if (event.type === "channel_created" && AUTO_JOIN && event.channel?.id) {
 		const info = await channelInfo(inst, event.channel.id)

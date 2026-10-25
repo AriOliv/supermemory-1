@@ -82,7 +82,8 @@ Reinicie após editar o `.env`: `sudo systemctl restart supermemory-compat`.
 
 1. No app Slack → **Event Subscriptions** → Enable → **Request URL**:
    `https://api.os.avenia.tech/brain/slack/events` → deve dar **Verified** ✅.
-2. **Subscribe to bot events**: `app_mention`, `message.channels` (obrigatórios) e
+2. **Subscribe to bot events**: `app_mention`, `message.channels`, `user_change`, `team_join`
+   (obrigatórios) e
    `channel_created` (só com `SLACK_AUTO_JOIN`) → **Save Changes** → reinstale se o Slack pedir.
    `message.groups`/`message.im` não são necessários na fase 1: o backend descarta canais
    privados e DMs.
@@ -135,6 +136,25 @@ Logs (`journalctl -u supermemory-compat | grep '\[slack\]'`) só têm IDs, statu
 erro, nunca o texto: `ingest queued|posted|done|not_durable|skipped|retry|dead`,
 `channel sync … member=N`. `GET /brain/slack/status` devolve as contagens da fila e o número de
 canais públicos em que o bot está.
+
+## Identidade das pessoas
+
+O compat mantém um diretório do Slack em `sm_slack_user` (`users.list` no boot e a cada 6h, mais
+os eventos `user_change`/`team_join`): nome, display name, e-mail, cargo, fuso, bot, guest,
+desativado. Os escopos `users:read` + `users:read.email` bastam (o cargo vem do perfil em
+`users.list`). A identidade canônica é o **e-mail**.
+
+Cada documento ingerido:
+- começa com a atribuição, ex. `Nome (cargo) em #canal: …`, e a triagem `durable` recebe esse
+  cabeçalho e é instruída a manter quem disse/decidiu o quê;
+- tem as menções reescritas: `<@U…>` → `@Nome` (bots como `@Nome (bot)`), `<#C…|x>` → `#x`,
+  links `<url|texto>` → `texto (url)`;
+- leva nos metadados `authorSlackId`, `authorName`, `authorEmail`, `authorTitle`,
+  `authorUserId` (usuário do console com o mesmo e-mail), `authorIsBot`, `authorIsGuest`,
+  `authorDeactivated`, `mentionedUserIds` e `mentionedEmails` (listas separadas por vírgula; bots
+  ficam fora dos e-mails).
+
+Mensagens postadas por bots, apps e workflows não são ingeridas.
 
 ## Escopo de memória (fase 1)
 
