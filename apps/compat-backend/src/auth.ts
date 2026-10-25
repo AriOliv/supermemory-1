@@ -2,7 +2,6 @@ import { Database } from "bun:sqlite"
 import { betterAuth, type BetterAuthOptions } from "better-auth"
 import {
 	admin,
-	anonymous,
 	apiKey,
 	emailOTP,
 	jwt,
@@ -25,7 +24,6 @@ import { actionEmail, sendEmail } from "./email"
  *   - organization plugin                → onboarding / EnsureWorkspace gate
  *   - apiKey plugin                      → settings / integrations (keys for external tools)
  *   - username plugin                    → onboarding updateUser({username})
- *   - anonymous plugin                   → guest sign-in
  *
  * cookiePrefix MUST be "better-auth" so apps/web/middleware.ts finds the session.
  */
@@ -51,7 +49,7 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID ?? ""
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET ?? ""
 const socialProviders =
 	GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET
-		? { google: { clientId: GOOGLE_CLIENT_ID, clientSecret: GOOGLE_CLIENT_SECRET } }
+		? { google: { clientId: GOOGLE_CLIENT_ID, clientSecret: GOOGLE_CLIENT_SECRET, hd: "avenia.io" } }
 		: {}
 // Prod only: share the session cookie across subdomains (console + API on *.os.avenia.tech).
 // Unset in local dev, so the default localhost-friendly cookie is kept there.
@@ -76,10 +74,13 @@ export const authOptions = {
 	databaseHooks: {
 		user: {
 			create: {
+				// New accounts must come from a provider that proved ownership of a company
+				// e-mail (Google marks emailVerified). Password, anonymous, magic-link and OTP
+				// sign-ups create unverified users and are refused; existing users still sign in.
 				before: async (user) => {
 					const domain = user.email?.split("@").pop()?.toLowerCase() ?? ""
-					if (!ALLOWED_EMAIL_DOMAINS.includes(domain)) {
-						throw new APIError("FORBIDDEN", { message: "Sign-up is restricted to company accounts" })
+					if (!ALLOWED_EMAIL_DOMAINS.includes(domain) || user.emailVerified !== true) {
+						throw new APIError("FORBIDDEN", { message: "Sign-up is restricted to verified company accounts" })
 					}
 				},
 			},
@@ -87,7 +88,8 @@ export const authOptions = {
 	},
 	emailAndPassword: {
 		enabled: true,
-		requireEmailVerification: false,
+		disableSignUp: true,
+		requireEmailVerification: true,
 		autoSignIn: true,
 		sendResetPassword: async ({ user, url }) => {
 			await sendEmail({
@@ -138,10 +140,10 @@ export const authOptions = {
 		// Disabling it globally also covers keys created before this change.
 		apiKey({ enableMetadata: true, maximumPrefixLength: 64, rateLimit: { enabled: false } }),
 		username(),
-		anonymous(),
 		jwt(),
 		mcp({ loginPage: LOGIN_PAGE, resource: MCP_RESOURCE }),
 		magicLink({
+			disableSignUp: true,
 			sendMagicLink: async ({ email, url }) => {
 				await sendEmail({
 					to: email,
@@ -156,6 +158,7 @@ export const authOptions = {
 			},
 		}),
 		emailOTP({
+			disableSignUp: true,
 			sendVerificationOTP: async ({ email, otp }) => {
 				await sendEmail({
 					to: email,
