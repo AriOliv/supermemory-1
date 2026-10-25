@@ -417,7 +417,6 @@ type SlackApiUser = {
 	real_name?: string
 	deleted?: boolean
 	is_bot?: boolean
-	is_app_user?: boolean
 	is_restricted?: boolean
 	is_ultra_restricted?: boolean
 	tz?: string
@@ -458,7 +457,8 @@ function upsertUser(teamId: string, u: SlackApiUser) {
 		str(u.name),
 		str(p.email)?.toLowerCase() ?? null,
 		str(p.title),
-		u.is_bot || u.is_app_user || u.id === "USLACKBOT" ? 1 : 0,
+		// is_app_user marks a person who authorized an app, not a bot — only is_bot counts.
+		u.is_bot || u.id === "USLACKBOT" ? 1 : 0,
 		u.is_restricted ? 1 : 0,
 		u.is_ultra_restricted ? 1 : 0,
 		u.deleted ? 1 : 0,
@@ -1028,8 +1028,12 @@ async function handleMention(inst: Install, event: any) {
 		return
 	}
 	if (!text) return
-	const memories = await retrieveContext(text, [ORG_BRAIN_TAG])
-	const reply = await answer(text, memories)
+	// Question: resolve the other mentions to names so "o que o @Fulano decidiu?" keeps the person.
+	const raw = (event.text ?? "").replace(new RegExp(`<@${inst.bot_user_id ?? "NONE"}>`, "g"), " ")
+	const users = await lookupUsers(inst, mentionedIds(raw))
+	const question = resolveMrkdwn(inst.team_id, raw, users).replace(/\s+/g, " ").trim() || text
+	const memories = await retrieveContext(question, [ORG_BRAIN_TAG])
+	const reply = await answer(question, memories)
 	await postMessage(inst, event.channel, reply, event.thread_ts ?? event.ts)
 }
 
