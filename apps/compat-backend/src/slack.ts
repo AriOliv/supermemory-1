@@ -76,6 +76,15 @@ const AUTO_JOIN_EXCLUDE = new Set(
 		.map((s) => s.trim())
 		.filter(Boolean),
 )
+// Name globs (only `*` is special) never auto-joined — covers channels created later, which the
+// ID list can't know about. Default: bot/alert/deploy feeds. Set to "" to disable.
+const AUTO_JOIN_EXCLUDE_PATTERNS = (process.env.SLACK_AUTO_JOIN_EXCLUDE_PATTERNS ?? "alerts-*,*-alerts,*-alerts-*,*-alertas,*-deploys")
+	.split(",")
+	.map((s) => s.trim().toLowerCase())
+	.filter(Boolean)
+	.map((g) => new RegExp(`^${g.split("*").map((p) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`))
+const autoJoinExcluded = (info: ChannelInfo) =>
+	AUTO_JOIN_EXCLUDE.has(info.id) || AUTO_JOIN_EXCLUDE_PATTERNS.some((re) => re.test((info.name ?? "").toLowerCase()))
 // The org's shared Company Brain space (the same tag chat/MCP treat as the org brain).
 const ORG_BRAIN_TAG = process.env.SM_BRAIN_CONTAINER_TAG ?? "sm_org_shared"
 
@@ -737,7 +746,7 @@ async function syncChannels(inst: Install) {
 			const info: ChannelInfo = { id: ch.id, name: ch.name, isPublic: true, isExtShared: Boolean(ch.is_ext_shared) }
 			upsertChannel(inst.team_id, info, ch.is_member ? "member" : null)
 			if (ch.is_member) member++
-			else if (AUTO_JOIN && brainEligible(info) && !AUTO_JOIN_EXCLUDE.has(ch.id)) toJoin.push(info)
+			else if (AUTO_JOIN && brainEligible(info) && !autoJoinExcluded(info)) toJoin.push(info)
 		}
 		cursor = r.response_metadata?.next_cursor ?? ""
 	} while (cursor)
@@ -833,7 +842,7 @@ async function handleEvent(inst: Install, event: any) {
 	// New public channel → join it right away when auto-join is on (needs the channel_created event).
 	if (event.type === "channel_created" && AUTO_JOIN && event.channel?.id) {
 		const info = await channelInfo(inst, event.channel.id)
-		if (info && brainEligible(info) && !AUTO_JOIN_EXCLUDE.has(info.id)) await joinChannel(inst, info)
+		if (info && brainEligible(info) && !autoJoinExcluded(info)) await joinChannel(inst, info)
 		return
 	}
 	if (event.type === "message") {

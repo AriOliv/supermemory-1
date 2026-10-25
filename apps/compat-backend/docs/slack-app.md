@@ -113,7 +113,9 @@ O bot só recebe mensagens dos canais em que é membro. Duas formas:
 - **Convite manual** (padrão): `/invite @supermemory` em cada canal público.
 - **Auto-join** (`SLACK_AUTO_JOIN=true`, escopo `channels:join`): a cada 6h (e no boot) o bot
   entra em todo canal público interno; com o evento `channel_created`, entra nos novos na
-  hora. `SLACK_AUTO_JOIN_EXCLUDE` lista IDs de canal a ignorar. Sem o escopo, o backend loga
+  hora. `SLACK_AUTO_JOIN_EXCLUDE` lista IDs de canal a ignorar e
+  `SLACK_AUTO_JOIN_EXCLUDE_PATTERNS` (padrão `alerts-*,*-alerts,*-alerts-*,*-alertas,*-deploys`) ignora pelo
+  nome, inclusive canais criados depois. Convite manual continua valendo para um canal excluído. Sem o escopo, o backend loga
   `auto-join disabled` e segue só com os convites.
 
 Antes de ingerir, o backend confere o canal em `conversations.info`: só canais públicos
